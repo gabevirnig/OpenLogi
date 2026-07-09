@@ -51,20 +51,59 @@ pub const GESTURE_BUTTON_CID: u16 = 0x00c3;
 /// cross-checked against Solaar `special_keys.py`.
 pub const DPI_MODE_SHIFT_CIDS: [u16; 3] = [0x00c4, 0x00ed, 0x00fd];
 
-/// Control IDs of the Back button family. Many Logitech mice (MX Vertical,
-/// MX Master side buttons over Bolt, etc.) report Back via HID++ rather than as
-/// a standard OS mouse button 4 — so the OS hook never sees the press. Divert
-/// whichever of these the device exposes and map to
-/// [`ButtonId::Back`](openlogi_core::binding::ButtonId::Back).
-///
-/// `0x0053` is the MX Vertical low-range CID; `0x00BD` / `0x00CE` / `0x00DB` are
-/// MultiPlatform Back CIDs from the `0x1b04` control-ID list (Solaar
-/// `special_keys.py`).
-pub const BACK_CIDS: [u16; 4] = [0x0053, 0x00bd, 0x00ce, 0x00db];
+/// Known Back-family control IDs (Solaar `special_keys.py` + `0x1b04` list).
+/// Used as a fallback when task-id discovery finds nothing; primary matching
+/// is by [`is_back_task`] / [`is_forward_task`] so unknown CIDs still work.
+pub const BACK_CIDS: [u16; 7] = [
+    0x0053, // Back_Button (MX Vertical / classic)
+    0x0054, // Back (HID)
+    0x0055, // Back_As_Alt_Win_Arrow
+    0x00bd, // MultiPlatform Back
+    0x00ce, // MultiPlatform Back (alt)
+    0x00db, // Back_Button_Short_Press
+    0x00ac, // Back_Hscroll (some MX models)
+];
 
-/// Control IDs of the Forward button family. Counterpart to [`BACK_CIDS`]:
-/// `0x0056` (MX Vertical) and `0x00CF` (MultiPlatform Forward).
-pub const FORWARD_CIDS: [u16; 2] = [0x0056, 0x00cf];
+/// Known Forward-family control IDs.
+pub const FORWARD_CIDS: [u16; 5] = [
+    0x0056, // Forward_Button (MX Vertical / classic)
+    0x0057, // Forward_As_HID
+    0x0058, // Forward_As_Alt_Win_Arrow
+    0x00cf, // MultiPlatform Forward
+    0x00d9, // Next_Button_Shortpress (forward rocker on some MX)
+];
+
+/// Solaar / Logitech task IDs that mean "Back" on a mouse control.
+/// Task IDs are more stable across MX Master firmware than raw CIDs.
+pub const BACK_TASK_IDS: [u16; 6] = [
+    0x003b, // BACK
+    0x003c, // MOUSE_BACK_BUTTON
+    0x0084, // WIN8_BACK
+    0x008b, // WIN8_BACK_HORZ_LEFT
+    0x0099, // MULTI_PLATFORM_BACK
+    0x00ab, // MULTI_PLATFORM_BACK_2
+];
+
+/// Task IDs that mean "Forward" on a mouse control.
+pub const FORWARD_TASK_IDS: [u16; 5] = [
+    0x003d, // BROWSER_FORWARD
+    0x003e, // MOUSE_FORWARD_BUTTON
+    0x0085, // WIN8_FORWARD
+    0x008c, // WIN8_FORWARD_HORZ_RIGHT
+    0x00ac, // MULTI_PLATFORM_FORWARD
+];
+
+/// Whether this control's default task is a Back navigation task.
+#[must_use]
+pub fn is_back_task(task_id: u16) -> bool {
+    BACK_TASK_IDS.contains(&task_id)
+}
+
+/// Whether this control's default task is a Forward navigation task.
+#[must_use]
+pub fn is_forward_task(task_id: u16) -> bool {
+    FORWARD_TASK_IDS.contains(&task_id)
+}
 
 /// Identity and capabilities of one reprogrammable control, as returned by
 /// `getCtrlIdInfo`.

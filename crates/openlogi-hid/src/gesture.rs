@@ -295,10 +295,22 @@ async fn arm_controls(
             }
         }
         // Back/Forward often report only via HID++ (not as OS mouse buttons 4/5).
-        // Divert them so remaps and browser-nav actions actually fire.
-        for &cid in &reprog_controls::BACK_CIDS {
-            if controls.iter().any(|c| c.cid == cid && c.is_divertable()) {
-                if let Err(e) = rc.set_cid_reporting(cid, true, false).await {
+        // Discover by task ID first (stable across MX Master firmware), then
+        // fall back to known CID lists so older Vertical-style tables still match.
+        for c in &controls {
+            if !c.is_divertable() {
+                continue;
+            }
+            let is_back = reprog_controls::is_back_task(c.task_id)
+                || reprog_controls::BACK_CIDS.contains(&c.cid);
+            let is_forward = reprog_controls::is_forward_task(c.task_id)
+                || reprog_controls::FORWARD_CIDS.contains(&c.cid);
+            // Prefer task match when both could fire (shouldn't, but be strict).
+            if is_back && !is_forward {
+                if back_cids.contains(&c.cid) {
+                    continue;
+                }
+                if let Err(e) = rc.set_cid_reporting(c.cid, true, false).await {
                     if gesture_diverted {
                         let _ = rc
                             .set_cid_reporting(reprog_controls::GESTURE_BUTTON_CID, false, false)
@@ -309,12 +321,13 @@ async fn arm_controls(
                     }
                     return Err(GestureError::Hidpp(format!("{e:?}")));
                 }
-                back_cids.push(cid);
-            }
-        }
-        for &cid in &reprog_controls::FORWARD_CIDS {
-            if controls.iter().any(|c| c.cid == cid && c.is_divertable()) {
-                if let Err(e) = rc.set_cid_reporting(cid, true, false).await {
+                info!(cid = format_args!("{:#06x}", c.cid), task = format_args!("{:#06x}", c.task_id), "diverting Back control");
+                back_cids.push(c.cid);
+            } else if is_forward {
+                if forward_cids.contains(&c.cid) {
+                    continue;
+                }
+                if let Err(e) = rc.set_cid_reporting(c.cid, true, false).await {
                     if gesture_diverted {
                         let _ = rc
                             .set_cid_reporting(reprog_controls::GESTURE_BUTTON_CID, false, false)
@@ -329,8 +342,14 @@ async fn arm_controls(
                     }
                     return Err(GestureError::Hidpp(format!("{e:?}")));
                 }
-                forward_cids.push(cid);
+                info!(cid = format_args!("{:#06x}", c.cid), task = format_args!("{:#06x}", c.task_id), "diverting Forward control");
+                forward_cids.push(c.cid);
             }
+        }
+        if back_cids.is_empty() && forward_cids.is_empty() {
+            warn!(
+                "no divertable Back/Forward controls found on device — side buttons may stay dead"
+            );
         }
         reprog = Some((rc, info.index));
     }
