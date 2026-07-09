@@ -25,10 +25,18 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::{ButtonId, EventDisposition, HookError, MouseEvent};
 
 const WHEEL_DELTA: f32 = 120.0;
+/// WinUser.h `WM_MOUSEMOVE` — not always re-exported by the windows-sys feature
+/// set we pull, so keep the documented constant here.
+const WM_MOUSEMOVE: u32 = 0x0200;
 
 type HookCallback = Arc<dyn Fn(MouseEvent) -> EventDisposition + Send + Sync + 'static>;
 
 static CALLBACK: Mutex<Option<HookCallback>> = Mutex::new(None);
+
+/// Last absolute cursor position from `WM_MOUSEMOVE`, used to synthesize the
+/// relative deltas [`MouseEvent::Moved`] needs for hold+swipe detection.
+/// `WH_MOUSE_LL` only reports absolute `pt`, not deltas.
+static LAST_CURSOR: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
 pub(crate) struct HookInner {
     thread_id: u32,
@@ -163,6 +171,9 @@ fn clear_callback() {
     if let Ok(mut slot) = CALLBACK.lock() {
         *slot = None;
     }
+    if let Ok(mut last) = LAST_CURSOR.lock() {
+        *last = None;
+    }
 }
 
 /// Forward the event to the next hook in the chain — the default disposition
@@ -248,6 +259,29 @@ fn translate_event(wparam: WPARAM, data: MSLLHOOKSTRUCT) -> Option<MouseEvent> {
     }
 
     match wparam as u32 {
+        // Cursor motion. Required for hold+swipe on OS-hook gesture buttons and
+        // for HID++-only Back/Forward holds that feed the same swipe detector.
+        // Low-level hooks report absolute screen coords in `pt` — convert to a
+        // relative delta against the previous sample.
+        WM_MOUSEMOVE => {
+            let x = data.pt.x;
+            let y = data.pt.y;
+            let Ok(mut last) = LAST_CURSOR.lock() else {
+                return None;
+            };
+            let (dx, dy) = match *last {
+                Some((lx, ly)) => (x.saturating_sub(lx), y.saturating_sub(ly)),
+                None => (0, 0),
+            };
+            *last = Some((x, y));
+            if dx == 0 && dy == 0 {
+                return None;
+            }
+            Some(MouseEvent::Moved {
+                delta_x: dx,
+                delta_y: dy,
+            })
+        }
         // A positive high word means the wheel was rotated forward (away from the
         // user). Pass the sign through unchanged so `delta_y > 0` is "scroll up" on
         // every platform — matching macOS (`SCROLL_WHEEL_EVENT_DELTA_AXIS_1`) and
@@ -366,5 +400,29 @@ mod tests {
             delta_y > 0.0,
             "wheel-forward should scroll up, got {delta_y}"
         );
+    }
+
+    #[test]
+    fn mousemove_emits_relative_deltas() {
+        // Reset residual state from other tests.
+        if let Ok(mut last) = LAST_CURSOR.lock() {
+            *last = None;
+        }
+        let mut a = MSLLHOOKSTRUCT::default();
+        a.pt.x = 100;
+        a.pt.y = 200;
+        // First sample seeds position only.
+        assert!(translate_event(WM_MOUSEMOVE as WPARAM, a).is_none());
+
+        let mut b = MSLLHOOKSTRUCT::default();
+        b.pt.x = 130;
+        b.pt.y = 190;
+        let Some(MouseEvent::Moved { delta_x, delta_y }) =
+            translate_event(WM_MOUSEMOVE as WPARAM, b)
+        else {
+            panic!("expected a move event");
+        };
+        assert_eq!(delta_x, 30);
+        assert_eq!(delta_y, -10);
     }
 }
