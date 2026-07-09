@@ -273,14 +273,16 @@ pub struct AppState {
     /// Bindings for the *currently selected* device. Reloaded whenever the
     /// carousel selection changes.
     pub button_bindings: BTreeMap<ButtonId, Action>,
-    /// Per-direction sub-bindings for the current device's gesture owner. Edited
-    /// via the gesture picker and persisted as a [`Binding::Gesture`] entry under
-    /// the owning button — the HID++ gesture button ([`ButtonId::GestureButton`]) by default,
-    /// or a promoted Middle/Back/Forward — in the device's unified binding map
-    /// ([`DeviceConfig::bindings`]). Rebuilt by the `gesture_bindings_for_current` helper.
+    /// Per-direction sub-bindings for the current device's gesture buttons, keyed
+    /// by the owning [`ButtonId`]. Any number of buttons can be gesture buttons at
+    /// once (the HID++ gesture button ([`ButtonId::GestureButton`]) plus any of the
+    /// OS-hook Middle/Back/Forward). Each entry is edited via the gesture picker
+    /// and persisted as a [`Binding::Gesture`] under that button in the device's
+    /// unified binding map ([`DeviceConfig::bindings`]). Rebuilt by the
+    /// `gesture_bindings_for_current` helper.
     ///
     /// [`DeviceConfig::bindings`]: openlogi_core::config::DeviceConfig::bindings
-    pub gesture_bindings: BTreeMap<GestureDirection, Action>,
+    pub gesture_bindings: BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>>,
     pub dpi: u32,
     /// DPI capability load state keyed by [`DeviceRecord::config_key`]. Loaded
     /// lazily because HID++ reads must not block device switching or rendering.
@@ -1243,57 +1245,87 @@ impl AppState {
         )
     }
 
-    fn gesture_bindings_for_current(&self) -> BTreeMap<GestureDirection, Action> {
+    fn gesture_bindings_for_current(&self) -> BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>> {
         let Some(key) = self.current_record().map(|r| r.config_key.as_str()) else {
             return BTreeMap::new();
         };
-        match self.config.gesture_owner(key) {
-            // The HID++ gesture button seeds every direction from the defaults.
-            Some(ButtonId::GestureButton) => gesture_bindings_for(&self.config, Some(key)),
-            // A promoted OS-hook button is shown from its raw stored map (which
-            // `set_gesture_owner` seeds with full defaults), so the menu matches
-            // exactly what `oshook_gestures_for` dispatches — no seeding here.
-            Some(owner) => match self.config.bindings_for(key).get(&owner) {
-                Some(Binding::Gesture(map)) => map.clone(),
-                _ => BTreeMap::new(),
-            },
-            None => BTreeMap::new(),
+        let mut out = BTreeMap::new();
+        for button in self.config.gesture_buttons(key) {
+            let map = if button == ButtonId::GestureButton {
+                // The HID++ gesture button seeds every direction from the
+                // defaults, matching what the watcher dispatches.
+                gesture_bindings_for(&self.config, Some(key))
+            } else {
+                // An OS-hook button shows its raw stored map (seeded with full
+                // defaults on enable), matching what `oshook_gestures_for`
+                // dispatches — no extra seeding here.
+                match self.config.bindings_for(key).get(&button) {
+                    Some(Binding::Gesture(map)) => map.clone(),
+                    _ => BTreeMap::new(),
+                }
+            };
+            out.insert(button, map);
         }
+        out
     }
 
-    /// The current device's gesture button — the [`Binding::Gesture`] owner — or
-    /// `None` when no button is in gesture mode. Drives which button's card opens
-    /// the gesture menu rather than the single-action picker.
+    /// Every button on the current device currently in gesture mode. Drives the
+    /// multi-select gesture-button toggles and which cards open the gesture menu.
     #[must_use]
-    pub fn current_gesture_owner(&self) -> Option<ButtonId> {
-        let key = self.current_record()?.config_key.as_str();
-        self.config.gesture_owner(key)
+    pub fn gesture_buttons(&self) -> Vec<ButtonId> {
+        self.current_record()
+            .map(|r| self.config.gesture_buttons(&r.config_key))
+            .unwrap_or_default()
     }
 
-    /// Make `button` the current device's gesture button (or clear it with
-    /// `None`), enforcing the one-gesture-button-per-device lock. Persists, tells
-    /// the agent to rebuild, and refreshes the projected maps the UI reads.
-    pub fn commit_gesture_owner(&mut self, button: Option<ButtonId>) {
+    /// Whether `button` on the current device is in gesture mode.
+    #[must_use]
+    pub fn is_gesture_button(&self, button: ButtonId) -> bool {
+        self.current_record()
+            .is_some_and(|r| self.config.is_gesture_button(&r.config_key, button))
+    }
+
+    /// Toggle `button`'s gesture mode on the current device: enable it (a full
+    /// five-direction map) if it isn't a gesture button, or turn it off (back to a
+    /// single click action) if it is. Independent of every other button, so
+    /// multiple buttons can gesture at once. Persists and reloads the agent, then
+    /// refreshes the projected maps the UI reads.
+    pub fn toggle_gesture_button(&mut self, button: ButtonId) {
         let Some(key) = self.current_record().map(|r| r.config_key.clone()) else {
             return;
         };
-        match button {
-            Some(b) => {
-                self.config.set_gesture_owner(&key, b);
-            }
-            None => {
-                self.config.disable_gestures(&key);
-            }
+        if self.config.is_gesture_button(&key, button) {
+            self.config.disable_gesture(&key, button);
+        } else {
+            self.config.enable_gesture(&key, button);
         }
-        // The owner change shuffles bindings between the single + gesture maps.
         self.button_bindings = self.bindings_for_current();
         self.gesture_bindings = self.gesture_bindings_for_current();
-        self.persist_and_reload("gesture-button change");
+        self.persist_and_reload("gesture button toggle");
     }
 
-    /// Update a single gesture-button sub-binding in memory, on disk, and in the
-    /// shared gesture map the watcher thread reads.
-    pub fn commit_gesture_binding(&mut self, direction: GestureDirection, action: Action) {
+    /// Turn every gesture button on the current device off (the "Off" chip).
+    pub fn disable_all_gestures(&mut self) {
+        let Some(key) = self.current_record().map(|r| r.config_key.clone()) else {
+            return;
+        };
+        for button in self.config.gesture_buttons(&key) {
+            self.config.disable_gesture(&key, button);
+        }
+        self.button_bindings = self.bindings_for_current();
+        self.gesture_bindings = self.gesture_bindings_for_current();
+        self.persist_and_reload("gestures off");
+    }
+
+    /// Update a single gesture sub-binding for `button` in memory, on disk, and in
+    /// the shared maps the agent reads. A no-op when `button` isn't a gesture
+    /// button (its editor shouldn't be reachable in that state).
+    pub fn commit_gesture_binding(
+        &mut self,
+        button: ButtonId,
+        direction: GestureDirection,
+        action: Action,
+    ) {
         let Some(key) = self.current_record().map(|r| r.config_key.clone()) else {
             debug!(
                 ?direction,
@@ -1301,20 +1333,20 @@ impl AppState {
             );
             return;
         };
-        // Edit whichever button owns gestures — not always the HID++ gesture button. When
-        // gestures are off, a stray edit must NOT silently re-enable them on the
-        // default owner (the gesture editor shouldn't be reachable in that state):
-        // no-op instead.
-        let Some(owner) = self.config.gesture_owner(&key) else {
+        if !self.config.is_gesture_button(&key, button) {
             debug!(
+                ?button,
                 ?direction,
-                "gestures are off — ignoring gesture binding edit"
+                "not a gesture button — ignoring gesture binding edit"
             );
             return;
-        };
-        self.gesture_bindings.insert(direction, action.clone());
+        }
+        self.gesture_bindings
+            .entry(button)
+            .or_default()
+            .insert(direction, action.clone());
         self.config
-            .set_gesture_direction(&key, owner, direction, action);
+            .set_gesture_direction(&key, button, direction, action);
         // The agent owns the gesture watcher; have it rebuild from config.
         self.persist_and_reload("gesture binding");
     }

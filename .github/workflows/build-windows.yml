@@ -1,0 +1,54 @@
+# Build an unsigned Windows portable zip (GUI + agent) for personal use.
+# Does not require Azure signing secrets from upstream's release.yml.
+name: Build Windows
+
+on:
+  push:
+    branches: [multi-gesture]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -C target-feature=+crt-static
+
+jobs:
+  windows:
+    name: Windows EXE (${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-${{ matrix.arch }}
+
+      - name: Build OpenLogi (GUI + agent)
+        run: cargo build --release -p openlogi-gui -p openlogi-agent --target ${{ matrix.target }}
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist, stage | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\openlogi-gui.exe" stage\OpenLogi.exe
+          Copy-Item "target\${{ matrix.target }}\release\openlogi-agent.exe" stage\openlogi-agent.exe
+          $ref = $env:GITHUB_REF_NAME -replace '/', '-'
+          Compress-Archive -Path stage\* -DestinationPath "dist\OpenLogi-$ref-windows-${{ matrix.arch }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenLogi-windows-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 30

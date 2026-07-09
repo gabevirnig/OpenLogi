@@ -18,15 +18,16 @@ Per-device settings are keyed by the HID++ identifier (e.g. `2b042` for an
 MX Master 4):
 
 - `bindings` — one entry per rebindable button: either a single action, or a
-  per-direction table for the gesture button.
+  per-direction table (a gesture button). Any gesture-capable button — the
+  dedicated HID++ gesture button plus the OS-hook Middle/Back/Forward — can be a
+  gesture button, and several can be gesture buttons at once. A button is in
+  gesture mode exactly when its entry is a per-direction table.
 - `per_app_bindings` — overlays keyed by application id (bundle id such as
   `com.microsoft.VSCode` on macOS, `WM_CLASS` on Linux/X11) that take
   precedence while that app is frontmost.
 - `dpi_presets` — the ordered list cycled by the `CycleDpiPresets` action.
 - `lighting` — static RGB colour, brightness (0–100), and on/off for wired
   RGB keyboards.
-- `gesture_owner` — which button owns the gesture role, when chosen
-  explicitly (otherwise inferred).
 
 The app-wide `[app_settings]` block holds `launch_at_login`,
 `check_for_updates` (both off by default), `show_in_menu_bar` (macOS-only)

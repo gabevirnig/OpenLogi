@@ -93,6 +93,7 @@ const GESTURE_CELL_W: f32 = 104.;
 /// a cell is clicked → only the plus shows), reset on popover close. Mutating it
 /// re-renders the view, which re-renders this open popover's content.
 pub fn gesture_overview(
+    button: ButtonId,
     view: &Entity<MouseModelView>,
     cx: &mut Context<PopoverState>,
 ) -> AnyElement {
@@ -101,9 +102,11 @@ pub fn gesture_overview(
     h_flex()
         .items_start()
         .gap_2()
-        .child(plus_card(view, active, pal, cx))
+        .child(plus_card(button, view, active, pal, cx))
         // The flyout card only appears once a direction is activated.
-        .when_some(active, |row, dir| row.child(flyout_card(dir, view, pal, cx)))
+        .when_some(active, |row, dir| {
+            row.child(flyout_card(button, dir, view, pal, cx))
+        })
         .into_any_element()
 }
 
@@ -130,6 +133,7 @@ fn menu_card(pal: Palette) -> gpui::Div {
 /// action; the `active` cell (if any) is accented. Clicking a cell activates
 /// that direction (flying out the level-2 card) without committing.
 fn plus_card(
+    button: ButtonId,
     view: &Entity<MouseModelView>,
     active: Option<GestureDirection>,
     pal: Palette,
@@ -140,7 +144,7 @@ fn plus_card(
         .map(|d| {
             let action = cx
                 .try_global::<AppState>()
-                .and_then(|s| s.gesture_bindings.get(&d).cloned())
+                .and_then(|s| s.gesture_bindings.get(&button).and_then(|m| m.get(&d)).cloned())
                 .unwrap_or_else(|| default_gesture_binding(d));
             (d, action)
         })
@@ -235,6 +239,7 @@ fn direction_cell(
 /// commits and stays open, so the level-1 cell + checkmark update in place and
 /// the user can keep editing other directions.
 fn flyout_card(
+    button: ButtonId,
     dir: GestureDirection,
     view: &Entity<MouseModelView>,
     pal: Palette,
@@ -242,12 +247,14 @@ fn flyout_card(
 ) -> AnyElement {
     let current = cx
         .try_global::<AppState>()
-        .and_then(|s| s.gesture_bindings.get(&dir).cloned())
+        .and_then(|s| s.gesture_bindings.get(&button).and_then(|m| m.get(&dir)).cloned())
         .unwrap_or_else(|| default_gesture_binding(dir));
 
     let view_pick = view.clone();
     let on_pick: PickFn = Rc::new(move |action, _window, cx| {
-        cx.update_global::<AppState, _>(|state, _| state.commit_gesture_binding(dir, action));
+        cx.update_global::<AppState, _>(|state, _| {
+            state.commit_gesture_binding(button, dir, action);
+        });
         // Stay open; re-render so the level-1 cell + checkmark update.
         view_pick.update(cx, |_, vcx| vcx.notify());
     });

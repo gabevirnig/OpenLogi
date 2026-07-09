@@ -90,14 +90,14 @@ impl MouseModelView {
 
 impl Render for MouseModelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (asset, active, bindings, gesture_owner, glow) = cx
+        let (asset, active, bindings, gesture_buttons, glow) = cx
             .try_global::<AppState>()
             .map(|s| {
                 (
                     s.current_record().and_then(|r| r.asset.clone()),
                     s.active_button,
                     s.button_bindings.clone(),
-                    s.current_gesture_owner(),
+                    s.gesture_buttons(),
                     s.current_record().and_then(|r| keyboard_glow(s, r)),
                 )
             })
@@ -131,12 +131,14 @@ impl Render for MouseModelView {
 
         let hotspots_outer = hotspots.clone();
         let labels_outer = labels.clone();
-        // Resolve the gesture owner against the buttons this device actually has:
-        // a mouse with no HID++ gesture button must not surface that default owner
-        // (it has none) — the role then reads as "Off" until the user picks a
-        // present button. Display-only; the stored config still infers as usual.
+        // Resolve the gesture buttons against the buttons this device actually
+        // has: a mouse with no HID++ gesture button must not surface it here.
+        // Display-only; the stored config is unchanged. Any number can be active.
         let capable = gesture_capable_buttons(&labels_outer);
-        let gesture_owner = gesture_owner.filter(|id| capable.contains(id));
+        let gesture_buttons: Vec<ButtonId> = gesture_buttons
+            .into_iter()
+            .filter(|id| capable.contains(id))
+            .collect();
         let leader_canvas = leader_canvas(hotspots, labels, highlight, mouse_left, mouse_w);
         let breathing_art = breathing_art(asset.as_ref(), mouse_left, mouse_w, mouse_h, pal, glow);
         let hotspots_layer = hotspots_layer(
@@ -146,7 +148,7 @@ impl Render for MouseModelView {
             mouse_h,
             hovered,
             active,
-            gesture_owner,
+            &gesture_buttons,
             &view,
         );
         let canvas = div()
@@ -156,7 +158,7 @@ impl Render for MouseModelView {
             .child(breathing_art)
             .child(leader_canvas)
             .children(labels_outer.iter().enumerate().map(|(idx, label)| {
-                let binding = if Some(label.id) == gesture_owner {
+                let binding = if gesture_buttons.contains(&label.id) {
                     BindingLabel {
                         text: tr!("5 directions"),
                         is_default: false,
@@ -186,22 +188,22 @@ impl Render for MouseModelView {
                     mouse_w,
                     hovered,
                     active,
-                    gesture_owner,
+                    &gesture_buttons,
                     &view,
                 )
             }))
             .child(hotspots_layer);
 
-        // The gesture-button selector sits above the mouse: a single-select of
-        // the device's gesture-capable buttons (the HID++ gesture button plus the
-        // OS-hook Middle/Back/Forward) makes the one-gesture-button-per-device
-        // lock visible and obvious — pick one and its card opens the gesture
-        // menu, the rest stay single-action.
+        // The gesture-button selector sits above the mouse: a multi-select of the
+        // device's gesture-capable buttons (the HID++ gesture button plus the
+        // OS-hook Middle/Back/Forward). Each is an independent toggle — turn on as
+        // many as you like, and every enabled button's card opens the
+        // five-direction gesture menu; the rest stay single-action.
         v_flex()
             .w(px(canvas_w))
             .gap_4()
             .when(!capable.is_empty(), |col| {
-                col.child(gesture_owner_selector(&capable, gesture_owner, &view, pal))
+                col.child(gesture_button_selector(&capable, &gesture_buttons, &view, pal))
             })
             .child(canvas)
     }
@@ -264,8 +266,8 @@ fn gesture_capable_buttons(labels: &[Label]) -> Vec<ButtonId> {
         .collect()
 }
 
-/// Short, context-appropriate name for a gesture-button choice.
-fn gesture_owner_label(btn: ButtonId) -> &'static str {
+/// Short, context-appropriate name for a gesture-button chip.
+fn gesture_chip_label(btn: ButtonId) -> &'static str {
     match btn {
         ButtonId::GestureButton => "Gesture Button",
         ButtonId::MiddleClick => "Middle",
@@ -275,12 +277,13 @@ fn gesture_owner_label(btn: ButtonId) -> &'static str {
     }
 }
 
-/// The "Gesture button: ( … )" single-select row above the mouse. The single
-/// select makes the one-gesture-button-per-device lock visible; picking a button
-/// commits it as the owner (demoting any previous one).
-fn gesture_owner_selector(
+/// The "Gesture Button: ( … )" multi-select row above the mouse. Each of the
+/// device's gesture-capable buttons is an independent toggle — highlighted when
+/// it is a gesture button, click to turn it on/off — so several can be active at
+/// once. The trailing "Off" chip clears them all and highlights when none are.
+fn gesture_button_selector(
     capable: &[ButtonId],
-    owner: Option<ButtonId>,
+    active: &[ButtonId],
     view: &Entity<MouseModelView>,
     pal: Palette,
 ) -> impl IntoElement {
@@ -297,28 +300,34 @@ fn gesture_owner_selector(
         .children(
             capable
                 .iter()
-                .map(|&btn| owner_chip(Some(btn), owner, view, pal)),
+                .map(|&btn| gesture_chip(Some(btn), active, view, pal)),
         )
-        .child(owner_chip(None, owner, view, pal))
+        .child(gesture_chip(None, active, view, pal))
 }
 
-/// One selectable chip in [`gesture_owner_selector`]. Clicking commits the new
-/// gesture owner via [`AppState::commit_gesture_owner`].
-fn owner_chip(
+/// One chip in [`gesture_button_selector`]. A button chip (`Some`) toggles that
+/// button's gesture mode via [`AppState::toggle_gesture_button`]; it is selected
+/// (blue) while the button is a gesture button. The `None` chip is "Off": it
+/// clears every gesture button ([`AppState::disable_all_gestures`]) and is
+/// selected only when none are active.
+fn gesture_chip(
     btn: Option<ButtonId>,
-    owner: Option<ButtonId>,
+    active: &[ButtonId],
     view: &Entity<MouseModelView>,
     pal: Palette,
 ) -> AnyElement {
-    let selected = btn == owner;
+    let selected = match btn {
+        Some(b) => active.contains(&b),
+        None => active.is_empty(),
+    };
     let text = match btn {
-        Some(b) => tr!(gesture_owner_label(b)),
+        Some(b) => tr!(gesture_chip_label(b)),
         None => tr!("Off"),
     };
     let id_part = btn.map_or(0usize, |b| b as usize + 1);
     let view = view.clone();
     div()
-        .id(("gesture-owner", id_part))
+        .id(("gesture-toggle", id_part))
         .px_2()
         .py_1()
         .rounded_md()
@@ -334,7 +343,10 @@ fn owner_chip(
         .cursor_pointer()
         .child(text)
         .on_click(move |_event, _window, cx| {
-            cx.update_global::<AppState, _>(|state, _| state.commit_gesture_owner(btn));
+            cx.update_global::<AppState, _>(|state, _| match btn {
+                Some(b) => state.toggle_gesture_button(b),
+                None => state.disable_all_gestures(),
+            });
             view.update(cx, |_, vcx| vcx.notify());
         })
         .into_any_element()
@@ -410,7 +422,7 @@ fn hotspots_layer(
     mouse_h: f32,
     hovered: Option<ButtonId>,
     active: Option<ButtonId>,
-    gesture_owner: Option<ButtonId>,
+    gesture_buttons: &[ButtonId],
     view: &Entity<MouseModelView>,
 ) -> impl IntoElement {
     div()
@@ -420,7 +432,7 @@ fn hotspots_layer(
         .w(px(mouse_w))
         .h(px(mouse_h))
         .children(hotspots.iter().enumerate().map(|(idx, hotspot)| {
-            hotspot_popover(idx, *hotspot, hovered, active, gesture_owner, view)
+            hotspot_popover(idx, *hotspot, hovered, active, gesture_buttons, view)
         }))
 }
 
@@ -432,6 +444,7 @@ fn hotspots_layer(
 /// next open starts on the plus.
 fn gesture_overview_popover<Tr>(
     popover_id: impl Into<ElementId>,
+    button: ButtonId,
     anchor: Anchor,
     trigger: Tr,
     view: Entity<MouseModelView>,
@@ -453,7 +466,7 @@ where
                 });
             }
         })
-        .content(move |_state, _window, cx| gesture_overview(&view, cx))
+        .content(move |_state, _window, cx| gesture_overview(button, &view, cx))
 }
 
 /// Position the popover wrapper at the label's slot in the side gutter and
@@ -474,7 +487,7 @@ fn label_popover(
     mouse_w: f32,
     hovered: Option<ButtonId>,
     active: Option<ButtonId>,
-    gesture_owner: Option<ButtonId>,
+    gesture_buttons: &[ButtonId],
     view: &Entity<MouseModelView>,
 ) -> AnyElement {
     let x = match label.side {
@@ -490,9 +503,10 @@ fn label_popover(
         selected: false,
         view: view.clone(),
     };
-    let popover: AnyElement = if Some(label.id) == gesture_owner {
+    let popover: AnyElement = if gesture_buttons.contains(&label.id) {
         gesture_overview_popover(
             ("label-popover", idx),
+            label.id,
             Anchor::TopLeft,
             trigger,
             view.clone(),
@@ -704,7 +718,7 @@ fn hotspot_popover(
     hotspot: Hotspot,
     hovered: Option<ButtonId>,
     active: Option<ButtonId>,
-    gesture_owner: Option<ButtonId>,
+    gesture_buttons: &[ButtonId],
     view: &Entity<MouseModelView>,
 ) -> AnyElement {
     let view = view.clone();
@@ -715,13 +729,14 @@ fn hotspot_popover(
         view: view.clone(),
         selected: false,
     };
-    // Open the gesture menu only for the button that currently OWNS gestures —
-    // matching the side-label path — so a promoted Middle/Back/Forward opens it
-    // here too, a demoted gesture button opens the plain picker, and (when gestures
-    // are off) no hotspot re-enters the gesture editor.
-    let popover: AnyElement = if Some(hotspot.id) == gesture_owner {
+    // Open the gesture menu for any button currently in gesture mode — matching
+    // the side-label path — so each enabled Middle/Back/Forward (and the HID++
+    // gesture button) opens the five-direction editor here too, while a
+    // single-action button opens the plain picker.
+    let popover: AnyElement = if gesture_buttons.contains(&hotspot.id) {
         gesture_overview_popover(
             ("hotspot-popover", idx),
+            hotspot.id,
             Anchor::TopRight,
             trigger,
             view.clone(),
@@ -818,9 +833,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gesture_owner_selector_keeps_physical_gesture_button_name() {
+    fn gesture_chip_keeps_physical_gesture_button_name() {
         assert_eq!(
-            gesture_owner_label(ButtonId::GestureButton),
+            gesture_chip_label(ButtonId::GestureButton),
             "Gesture Button"
         );
     }
