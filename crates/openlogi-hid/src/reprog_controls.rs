@@ -51,6 +51,21 @@ pub const GESTURE_BUTTON_CID: u16 = 0x00c3;
 /// cross-checked against Solaar `special_keys.py`.
 pub const DPI_MODE_SHIFT_CIDS: [u16; 3] = [0x00c4, 0x00ed, 0x00fd];
 
+/// Control IDs of the Back button family. Many Logitech mice (MX Vertical,
+/// MX Master side buttons over Bolt, etc.) report Back via HID++ rather than as
+/// a standard OS mouse button 4 — so the OS hook never sees the press. Divert
+/// whichever of these the device exposes and map to
+/// [`ButtonId::Back`](openlogi_core::binding::ButtonId::Back).
+///
+/// `0x0053` is the MX Vertical low-range CID; `0x00BD` / `0x00CE` / `0x00DB` are
+/// MultiPlatform Back CIDs from the `0x1b04` control-ID list (Solaar
+/// `special_keys.py`).
+pub const BACK_CIDS: [u16; 4] = [0x0053, 0x00bd, 0x00ce, 0x00db];
+
+/// Control IDs of the Forward button family. Counterpart to [`BACK_CIDS`]:
+/// `0x0056` (MX Vertical) and `0x00CF` (MultiPlatform Forward).
+pub const FORWARD_CIDS: [u16; 2] = [0x0056, 0x00cf];
+
 /// Identity and capabilities of one reprogrammable control, as returned by
 /// `getCtrlIdInfo`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

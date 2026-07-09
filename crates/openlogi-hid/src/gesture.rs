@@ -16,6 +16,7 @@
 //! is therefore only diverted when its click is actually bound.
 
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::{Duration, Instant};
 
 use hidpp::{channel::HidppChannel, device::Device, protocol::v20};
 use openlogi_core::binding::{ButtonId, GestureDirection, SwipeAccumulator};
@@ -75,7 +76,22 @@ struct CaptureAccum {
     /// Whether any DPI/ModeShift control was held in the last event — for
     /// rising-edge press detection.
     dpi_down: bool,
+    /// Whether any Back control was held in the last event.
+    back_down: bool,
+    /// Whether any Forward control was held in the last event.
+    forward_down: bool,
+    /// Timestamp of the last Back press dispatch — for debounce.
+    last_back: Option<Instant>,
+    /// Timestamp of the last Forward press dispatch — for debounce.
+    last_forward: Option<Instant>,
 }
+
+/// Minimum time between two Back or Forward dispatches from the same HID++
+/// CID. Some firmware (e.g. MX Vertical) sends multiple DivertedButtons frames
+/// per physical click as the CID flag bounces in/out within a single press.
+/// 150ms suppresses intra-press bounce while allowing intentional rapid
+/// double-clicks (typically ≥200ms apart).
+const BACK_FORWARD_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Capture the gesture button, DPI/ModeShift button, and (when
 /// `capture_thumbwheel`) the thumb wheel on `route` until `shutdown` resolves,
@@ -122,6 +138,8 @@ pub async fn run_capture_session(
     let reprog_index = armed.reprog.as_ref().map(|(_, idx)| *idx);
     let thumb_index = armed.thumb.as_ref().map(|(_, idx)| *idx);
     let dpi_set = armed.dpi_cids.clone();
+    let back_set = armed.back_cids.clone();
+    let forward_set = armed.forward_cids.clone();
     let listener = chan.add_msg_listener_guarded({
         let accum = Arc::clone(&accum);
         let sink = sink.clone();
@@ -136,7 +154,7 @@ pub async fn run_capture_session(
                 // Recover the guard even if a prior holder panicked — the
                 // critical section is panic-free, so the data is consistent.
                 let mut acc = accum.lock().unwrap_or_else(PoisonError::into_inner);
-                handle_reprog(&mut acc, event, &dpi_set, &sink);
+                handle_reprog(&mut acc, event, &dpi_set, &back_set, &forward_set, &sink);
                 return;
             }
             if let Some(idx) = thumb_index
@@ -156,6 +174,8 @@ pub async fn run_capture_session(
         index = device_index,
         gesture = armed.gesture_diverted,
         dpi_buttons = armed.dpi_cids.len(),
+        back_buttons = armed.back_cids.len(),
+        forward_buttons = armed.forward_cids.len(),
         thumbwheel = armed.thumb.is_some(),
         "control capture active"
     );
@@ -179,6 +199,10 @@ struct ArmedControls {
     gesture_diverted: bool,
     /// DPI/ModeShift CIDs diverted as plain buttons.
     dpi_cids: Vec<u16>,
+    /// Back button CIDs diverted as plain buttons.
+    back_cids: Vec<u16>,
+    /// Forward button CIDs diverted as plain buttons.
+    forward_cids: Vec<u16>,
     /// `0x2150` accessor + feature index, present when the thumb wheel is
     /// diverted.
     thumb: Option<(Thumbwheel, u8)>,
@@ -196,6 +220,15 @@ impl ArmedControls {
             }
             for &cid in &self.dpi_cids {
                 restore(rc.set_cid_reporting(cid, false, false).await, "DPI button");
+            }
+            for &cid in &self.back_cids {
+                restore(rc.set_cid_reporting(cid, false, false).await, "Back button");
+            }
+            for &cid in &self.forward_cids {
+                restore(
+                    rc.set_cid_reporting(cid, false, false).await,
+                    "Forward button",
+                );
             }
         }
         if let Some((tw, _)) = self.thumb.as_ref() {
@@ -222,6 +255,8 @@ async fn arm_controls(
     let mut reprog: Option<(ReprogControlsV4, u8)> = None;
     let mut gesture_diverted = false;
     let mut dpi_cids: Vec<u16> = Vec::new();
+    let mut back_cids: Vec<u16> = Vec::new();
+    let mut forward_cids: Vec<u16> = Vec::new();
     if let Some(info) = device
         .root()
         .get_feature(reprog_controls::FEATURE_ID)
@@ -245,10 +280,56 @@ async fn arm_controls(
         }
         for &cid in &reprog_controls::DPI_MODE_SHIFT_CIDS {
             if controls.iter().any(|c| c.cid == cid && c.is_divertable()) {
-                rc.set_cid_reporting(cid, true, false)
-                    .await
-                    .map_err(|e| GestureError::Hidpp(format!("{e:?}")))?;
+                if let Err(e) = rc.set_cid_reporting(cid, true, false).await {
+                    if gesture_diverted {
+                        let _ = rc
+                            .set_cid_reporting(reprog_controls::GESTURE_BUTTON_CID, false, false)
+                            .await;
+                    }
+                    for &diverted in &dpi_cids {
+                        let _ = rc.set_cid_reporting(diverted, false, false).await;
+                    }
+                    return Err(GestureError::Hidpp(format!("{e:?}")));
+                }
                 dpi_cids.push(cid);
+            }
+        }
+        // Back/Forward often report only via HID++ (not as OS mouse buttons 4/5).
+        // Divert them so remaps and browser-nav actions actually fire.
+        for &cid in &reprog_controls::BACK_CIDS {
+            if controls.iter().any(|c| c.cid == cid && c.is_divertable()) {
+                if let Err(e) = rc.set_cid_reporting(cid, true, false).await {
+                    if gesture_diverted {
+                        let _ = rc
+                            .set_cid_reporting(reprog_controls::GESTURE_BUTTON_CID, false, false)
+                            .await;
+                    }
+                    for &diverted in dpi_cids.iter().chain(back_cids.iter()) {
+                        let _ = rc.set_cid_reporting(diverted, false, false).await;
+                    }
+                    return Err(GestureError::Hidpp(format!("{e:?}")));
+                }
+                back_cids.push(cid);
+            }
+        }
+        for &cid in &reprog_controls::FORWARD_CIDS {
+            if controls.iter().any(|c| c.cid == cid && c.is_divertable()) {
+                if let Err(e) = rc.set_cid_reporting(cid, true, false).await {
+                    if gesture_diverted {
+                        let _ = rc
+                            .set_cid_reporting(reprog_controls::GESTURE_BUTTON_CID, false, false)
+                            .await;
+                    }
+                    for &diverted in dpi_cids
+                        .iter()
+                        .chain(back_cids.iter())
+                        .chain(forward_cids.iter())
+                    {
+                        let _ = rc.set_cid_reporting(diverted, false, false).await;
+                    }
+                    return Err(GestureError::Hidpp(format!("{e:?}")));
+                }
+                forward_cids.push(cid);
             }
         }
         reprog = Some((rc, info.index));
@@ -274,22 +355,33 @@ async fn arm_controls(
             }
         };
         if supports_single_tap {
-            tw.set_reporting(true, false)
-                .await
-                .map_err(|e| GestureError::Hidpp(format!("{e:?}")))?;
-            thumb = Some((tw, info.index));
+            // Don't abort the whole session on thumbwheel failure — Back/Forward
+            // may already be diverted and need a live session to restore them.
+            match tw.set_reporting(true, false).await {
+                Ok(()) => thumb = Some((tw, info.index)),
+                Err(e) => {
+                    warn!(error = ?e, "thumb wheel set_reporting failed — skipping click capture")
+                }
+            }
         } else {
             debug!("thumb wheel reports no single tap — click not capturable");
         }
     }
 
-    if !gesture_diverted && dpi_cids.is_empty() && thumb.is_none() {
+    if !gesture_diverted
+        && dpi_cids.is_empty()
+        && back_cids.is_empty()
+        && forward_cids.is_empty()
+        && thumb.is_none()
+    {
         debug!(slot, "no capturable controls — idle session");
     }
     Ok(ArmedControls {
         reprog,
         gesture_diverted,
         dpi_cids,
+        back_cids,
+        forward_cids,
         thumb,
     })
 }
@@ -323,12 +415,14 @@ async fn enumerate_controls(
 
 /// Update `acc` and emit on a decoded `0x1b04` event: commit a gesture swipe the
 /// instant it crosses the threshold (mid-swipe, like Options+) rather than on
-/// release, and emit a [`ButtonId::DpiToggle`] press on the rising edge of any
-/// diverted DPI/ModeShift control.
+/// release, and emit a press on the rising edge of diverted DPI/ModeShift /
+/// Back / Forward controls.
 fn handle_reprog(
     acc: &mut CaptureAccum,
     event: RawControlEvent,
     dpi_cids: &[u16],
+    back_cids: &[u16],
+    forward_cids: &[u16],
     sink: &mpsc::UnboundedSender<CapturedInput>,
 ) {
     match event {
@@ -349,6 +443,40 @@ fn handle_reprog(
                 let _ = sink.send(CapturedInput::ButtonPressed(ButtonId::DpiToggle));
             }
             acc.dpi_down = dpi_down;
+
+            let back_down = back_cids.iter().any(|cid| cids.contains(cid));
+            if back_down && !acc.back_down {
+                let now = Instant::now();
+                let elapsed = acc.last_back.map_or(BACK_FORWARD_DEBOUNCE, |t| now - t);
+                if elapsed >= BACK_FORWARD_DEBOUNCE {
+                    acc.last_back = Some(now);
+                    let _ = sink.send(CapturedInput::ButtonPressed(ButtonId::Back));
+                } else {
+                    debug!(
+                        elapsed_ms = elapsed.as_millis(),
+                        "Back debounced — too soon after last dispatch"
+                    );
+                }
+            }
+            acc.back_down = back_down;
+
+            let forward_down = forward_cids.iter().any(|cid| cids.contains(cid));
+            if forward_down && !acc.forward_down {
+                let now = Instant::now();
+                let elapsed = acc
+                    .last_forward
+                    .map_or(BACK_FORWARD_DEBOUNCE, |t| now - t);
+                if elapsed >= BACK_FORWARD_DEBOUNCE {
+                    acc.last_forward = Some(now);
+                    let _ = sink.send(CapturedInput::ButtonPressed(ButtonId::Forward));
+                } else {
+                    debug!(
+                        elapsed_ms = elapsed.as_millis(),
+                        "Forward debounced — too soon after last dispatch"
+                    );
+                }
+            }
+            acc.forward_down = forward_down;
         }
         RawControlEvent::RawXy { dx, dy } => {
             // Commit the instant a clean direction emerges (mid-swipe, once per
