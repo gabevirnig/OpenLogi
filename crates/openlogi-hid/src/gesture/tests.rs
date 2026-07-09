@@ -113,7 +113,7 @@ fn a_dpi_button_re_presses_after_a_release() {
 }
 
 #[test]
-fn back_button_presses_once_on_rising_edge() {
+fn back_button_emits_press_edge_once_on_rising_edge() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut acc = CaptureAccum::default();
     let back = reprog_controls::BACK_CIDS[0];
@@ -124,13 +124,37 @@ fn back_button_presses_once_on_rising_edge() {
 
     assert_eq!(
         rx.try_recv(),
-        Ok(CapturedInput::ButtonPressed(ButtonId::Back))
+        Ok(CapturedInput::ButtonEdge {
+            button: ButtonId::Back,
+            pressed: true
+        })
     );
     assert!(rx.try_recv().is_err(), "a held Back button presses once");
 }
 
 #[test]
-fn forward_button_presses_once_on_rising_edge() {
+fn back_button_emits_release_edge() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut acc = CaptureAccum::default();
+    let back = reprog_controls::BACK_CIDS[0];
+    let down = RawControlEvent::DivertedButtons([back, 0, 0, 0]);
+    let up = RawControlEvent::DivertedButtons([0, 0, 0, 0]);
+
+    handle_reprog(&mut acc, down, &[], &[back], &[], &tx);
+    let _ = rx.try_recv();
+    handle_reprog(&mut acc, up, &[], &[back], &[], &tx);
+
+    assert_eq!(
+        rx.try_recv(),
+        Ok(CapturedInput::ButtonEdge {
+            button: ButtonId::Back,
+            pressed: false
+        })
+    );
+}
+
+#[test]
+fn forward_button_emits_press_edge_once_on_rising_edge() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut acc = CaptureAccum::default();
     let forward = reprog_controls::FORWARD_CIDS[0];
@@ -141,7 +165,10 @@ fn forward_button_presses_once_on_rising_edge() {
 
     assert_eq!(
         rx.try_recv(),
-        Ok(CapturedInput::ButtonPressed(ButtonId::Forward))
+        Ok(CapturedInput::ButtonEdge {
+            button: ButtonId::Forward,
+            pressed: true
+        })
     );
     assert!(rx.try_recv().is_err(), "a held Forward button presses once");
 }

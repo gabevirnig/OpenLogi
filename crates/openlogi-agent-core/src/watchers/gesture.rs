@@ -342,6 +342,58 @@ fn dispatch(
                 debug!(?button, "HID++ button with no binding — ignored");
             }
         }
+        CapturedInput::ButtonEdge { button, pressed } => {
+            // Back/Forward over HID++: if the button is in gesture mode, track a
+            // hold and let the OS hook's Moved arm feed cursor deltas into the
+            // swipe detector. On release with no swipe, fire the Click action.
+            // If not in gesture mode, fire the single-action binding on press.
+            let is_gesture = hook_maps
+                .read()
+                .ok()
+                .is_some_and(|m| m.gestures.contains_key(&button));
+            if pressed {
+                if is_gesture {
+                    debug!(?button, "HID++ side button gesture hold begin");
+                    hook_runtime::begin_hidpp_side_gesture(button);
+                } else {
+                    let action = hook_maps
+                        .read()
+                        .ok()
+                        .and_then(|maps| maps.bindings.get(&button).cloned());
+                    if let Some(action) = action {
+                        debug!(?button, action = %action.label(), "HID++ side button → action");
+                        hook_runtime::dispatch_action(&action, dpi_cycle, capture);
+                    }
+                }
+            } else if is_gesture {
+                if let Some(was_click) = hook_runtime::end_hidpp_side_gesture(button)
+                    && was_click
+                {
+                    let action = hook_maps.read().ok().map(|m| {
+                        m.gestures
+                            .get(&button)
+                            .and_then(|dirs| dirs.get(&GestureDirection::Click).cloned())
+                            .unwrap_or_else(|| default_binding(button))
+                    });
+                    if let Some(action) = action {
+                        debug!(?button, action = %action.label(), "HID++ side gesture click → action");
+                        hook_runtime::dispatch_action(&action, dpi_cycle, capture);
+                    }
+                }
+            }
+        }
+        CapturedInput::ButtonGesture { button, direction } => {
+            // Rare path: side button delivered raw-XY over HID++ itself.
+            let action = hook_maps.read().ok().and_then(|m| {
+                m.gestures
+                    .get(&button)
+                    .and_then(|dirs| dirs.get(&direction).cloned())
+            });
+            if let Some(action) = action {
+                debug!(?button, ?direction, action = %action.label(), "HID++ side gesture → action");
+                hook_runtime::dispatch_action(&action, dpi_cycle, capture);
+            }
+        }
         CapturedInput::Scroll(rotation) => {
             // Positive rotation is "up"; each direction has its own binding.
             let up = rotation >= 0;

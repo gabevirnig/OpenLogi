@@ -95,6 +95,31 @@ thread_local! {
     static HOLD: RefCell<HoldState> = RefCell::new(HoldState::default());
 }
 
+/// Hold state for HID++-diverted Back/Forward buttons that never reach the OS
+/// hook as XButtons. The gesture watcher sets this on press/release; the OS
+/// hook's `Moved` arm feeds cursor deltas into it so hold+swipe still works.
+static HIDPP_SIDE_HOLD: std::sync::OnceLock<std::sync::Mutex<HoldState>> =
+    std::sync::OnceLock::new();
+
+fn hidpp_side_hold() -> &'static std::sync::Mutex<HoldState> {
+    HIDPP_SIDE_HOLD.get_or_init(|| std::sync::Mutex::new(HoldState::default()))
+}
+
+/// Begin a HID++ side-button hold (Back/Forward). Called when the capture
+/// session reports a press edge for a button currently in gesture mode.
+pub fn begin_hidpp_side_gesture(button: ButtonId) {
+    if let Ok(mut hold) = hidpp_side_hold().lock() {
+        hold.begin(button);
+    }
+}
+
+/// End a HID++ side-button hold. Returns `Some(true)` if no swipe committed
+/// (plain click), `Some(false)` if a swipe already fired, `None` if we weren't
+/// holding this button.
+pub fn end_hidpp_side_gesture(button: ButtonId) -> Option<bool> {
+    hidpp_side_hold().lock().ok().and_then(|mut hold| hold.end(button))
+}
+
 /// Attempt to start the OS hook. Returns `None` if Accessibility is not
 /// granted or on an unsupported platform — the app continues without crashing.
 pub fn start(
@@ -183,7 +208,13 @@ pub fn start(
             // not consumed (the B2 cursor-drift tradeoff vs. a HID++ raw-XY divert
             // that would freeze the pointer).
             let commit = HOLD.with_borrow_mut(|h| h.accumulate(delta_x, delta_y));
-            if let Some((button, dir)) = commit {
+            // Also feed HID++-only side-button holds (Back/Forward that never
+            // appear as OS XButtons). Same swipe detector, shared maps.
+            let hidpp_commit = hidpp_side_hold()
+                .lock()
+                .ok()
+                .and_then(|mut h| h.accumulate(delta_x, delta_y));
+            for (button, dir) in commit.into_iter().chain(hidpp_commit) {
                 // Resolve to an owned action and drop the read guard before
                 // dispatch (same lock-light rule as the release arm). The button
                 // can leave the gesture set mid-hold (a per-app rebuild); the

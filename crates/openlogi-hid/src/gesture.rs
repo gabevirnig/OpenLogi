@@ -38,12 +38,30 @@ pub type CaptureChannel = Arc<RwLock<Option<SharedChannel>>>;
 /// One input captured from the active device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CapturedInput {
-    /// A completed gesture-button swipe.
+    /// A completed swipe on the dedicated HID++ gesture button (CID 0x00c3).
     Gesture(GestureDirection),
+    /// A completed hold+swipe on a diverted side button (Back/Forward). Used
+    /// when those buttons report only over HID++ (no OS XButton events), so the
+    /// OS-hook gesture path never sees them.
+    ButtonGesture {
+        /// Which side button produced the swipe.
+        button: ButtonId,
+        /// Committed direction (or [`GestureDirection::Click`] on a plain tap).
+        direction: GestureDirection,
+    },
     /// A diverted button was pressed — the DPI/ModeShift button
     /// ([`ButtonId::DpiToggle`]) or the thumb-wheel single tap
-    /// ([`ButtonId::Thumbwheel`]).
+    /// ([`ButtonId::Thumbwheel`]). Rising-edge only; no hold tracking.
     ButtonPressed(ButtonId),
+    /// Press/release edge of a diverted Back/Forward control. The agent uses
+    /// this for hold+swipe when the button is in gesture mode, or fires the
+    /// single-action binding on press when it is not.
+    ButtonEdge {
+        /// Back or Forward.
+        button: ButtonId,
+        /// `true` on press, `false` on release.
+        pressed: bool,
+    },
     /// Thumb-wheel rotation to re-synthesise as horizontal scroll, in the
     /// wheel's `diverted_res` increments. Emitted only while the wheel is
     /// diverted to capture its click.
@@ -73,6 +91,11 @@ pub enum GestureError {
 struct CaptureAccum {
     /// Mid-swipe state for the diverted dedicated gesture button (raw-XY).
     swipe: SwipeAccumulator,
+    /// Mid-swipe state for a diverted Back/Forward hold that supports raw-XY.
+    /// Side buttons usually don't; the agent also tracks holds via OS motion.
+    side_swipe: SwipeAccumulator,
+    /// Which side button currently owns [`Self::side_swipe`], if any.
+    side_hold: Option<ButtonId>,
     /// Whether any DPI/ModeShift control was held in the last event — for
     /// rising-edge press detection.
     dpi_down: bool,
@@ -80,9 +103,9 @@ struct CaptureAccum {
     back_down: bool,
     /// Whether any Forward control was held in the last event.
     forward_down: bool,
-    /// Timestamp of the last Back press dispatch — for debounce.
+    /// Timestamp of the last Back press edge — for debounce.
     last_back: Option<Instant>,
-    /// Timestamp of the last Forward press dispatch — for debounce.
+    /// Timestamp of the last Forward press edge — for debounce.
     last_forward: Option<Instant>,
 }
 
@@ -434,8 +457,8 @@ async fn enumerate_controls(
 
 /// Update `acc` and emit on a decoded `0x1b04` event: commit a gesture swipe the
 /// instant it crosses the threshold (mid-swipe, like Options+) rather than on
-/// release, and emit a press on the rising edge of diverted DPI/ModeShift /
-/// Back / Forward controls.
+/// release, emit press/release edges for diverted Back/Forward, and emit a
+/// rising-edge press for DPI/ModeShift.
 fn handle_reprog(
     acc: &mut CaptureAccum,
     event: RawControlEvent,
@@ -463,19 +486,36 @@ fn handle_reprog(
             }
             acc.dpi_down = dpi_down;
 
+            // Back / Forward: emit press/release edges so the agent can track
+            // holds and feed OS cursor motion into swipe detection (side buttons
+            // usually lack raw-XY). Debounce rising edges for firmware bounce.
             let back_down = back_cids.iter().any(|cid| cids.contains(cid));
             if back_down && !acc.back_down {
                 let now = Instant::now();
                 let elapsed = acc.last_back.map_or(BACK_FORWARD_DEBOUNCE, |t| now - t);
                 if elapsed >= BACK_FORWARD_DEBOUNCE {
                     acc.last_back = Some(now);
-                    let _ = sink.send(CapturedInput::ButtonPressed(ButtonId::Back));
+                    acc.side_hold = Some(ButtonId::Back);
+                    acc.side_swipe.begin();
+                    let _ = sink.send(CapturedInput::ButtonEdge {
+                        button: ButtonId::Back,
+                        pressed: true,
+                    });
                 } else {
                     debug!(
                         elapsed_ms = elapsed.as_millis(),
-                        "Back debounced — too soon after last dispatch"
+                        "Back debounced — too soon after last press"
                     );
                 }
+            } else if !back_down && acc.back_down {
+                if acc.side_hold == Some(ButtonId::Back) {
+                    let _ = acc.side_swipe.end();
+                    acc.side_hold = None;
+                }
+                let _ = sink.send(CapturedInput::ButtonEdge {
+                    button: ButtonId::Back,
+                    pressed: false,
+                });
             }
             acc.back_down = back_down;
 
@@ -487,23 +527,43 @@ fn handle_reprog(
                     .map_or(BACK_FORWARD_DEBOUNCE, |t| now - t);
                 if elapsed >= BACK_FORWARD_DEBOUNCE {
                     acc.last_forward = Some(now);
-                    let _ = sink.send(CapturedInput::ButtonPressed(ButtonId::Forward));
+                    acc.side_hold = Some(ButtonId::Forward);
+                    acc.side_swipe.begin();
+                    let _ = sink.send(CapturedInput::ButtonEdge {
+                        button: ButtonId::Forward,
+                        pressed: true,
+                    });
                 } else {
                     debug!(
                         elapsed_ms = elapsed.as_millis(),
-                        "Forward debounced — too soon after last dispatch"
+                        "Forward debounced — too soon after last press"
                     );
                 }
+            } else if !forward_down && acc.forward_down {
+                if acc.side_hold == Some(ButtonId::Forward) {
+                    let _ = acc.side_swipe.end();
+                    acc.side_hold = None;
+                }
+                let _ = sink.send(CapturedInput::ButtonEdge {
+                    button: ButtonId::Forward,
+                    pressed: false,
+                });
             }
             acc.forward_down = forward_down;
         }
         RawControlEvent::RawXy { dx, dy } => {
-            // Commit the instant a clean direction emerges (mid-swipe, once per
-            // hold); the accumulator gates on hold duration internally and drops
-            // travel that arrives outside a hold.
+            // Dedicated gesture button first (raw-XY diverted with the hold).
             if let Some(direction) = acc.swipe.accumulate(i32::from(dx), i32::from(dy)) {
                 debug!(?direction, "gesture committed");
                 let _ = sink.send(CapturedInput::Gesture(direction));
+            }
+            // Side button hold with raw-XY (uncommon; most MX side buttons lack it).
+            if let Some(button) = acc.side_hold
+                && let Some(direction) =
+                    acc.side_swipe.accumulate(i32::from(dx), i32::from(dy))
+            {
+                debug!(?button, ?direction, "side-button gesture committed (raw-XY)");
+                let _ = sink.send(CapturedInput::ButtonGesture { button, direction });
             }
         }
     }
