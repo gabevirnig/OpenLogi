@@ -28,6 +28,8 @@ use gpui::{
 };
 use gpui_component::{Icon, IconName, h_flex, popover::PopoverState, v_flex};
 
+use openlogi_core::binding::KeyCombo;
+
 use crate::data::mouse_buttons::{
     Action, ButtonId, Category, GestureDirection, default_gesture_binding,
 };
@@ -49,35 +51,65 @@ const POPOVER_LIST_MAX_H: f32 = 360.;
 /// `observer` is whatever entity wraps the trigger — it's notified after the
 /// global updates so the trigger re-renders. Picking an action commits it and
 /// dismisses the popover.
-pub fn action_picker<T: 'static>(
+pub fn action_picker(
     btn: ButtonId,
-    observer: &Entity<T>,
+    view: &Entity<MouseModelView>,
     cx: &mut Context<PopoverState>,
 ) -> AnyElement {
     let current = cx
         .try_global::<AppState>()
         .and_then(|s| s.button_bindings.get(&btn).cloned());
 
-    let observer = observer.clone();
+    let view = view.clone();
     let popover = cx.entity().downgrade();
-    let on_pick: PickFn = Rc::new(move |action, window, cx| {
-        cx.update_global::<AppState, _>(|state, _| state.commit_binding(btn, action));
-        observer.update(cx, |_, cx| cx.notify());
-        if let Some(p) = popover.upgrade() {
-            p.update(cx, |s, cx| s.dismiss(window, cx));
+    let on_pick: PickFn = Rc::new({
+        let view = view.clone();
+        move |action, window, cx| {
+            cx.update_global::<AppState, _>(|state, _| state.commit_binding(btn, action));
+            view.update(cx, |v, vcx| {
+                v.close_shortcut_entry();
+                vcx.notify();
+            });
+            if let Some(p) = popover.upgrade() {
+                p.update(cx, |s, cx| s.dismiss(window, cx));
+            }
         }
     });
 
     let pal = theme::palette(cx);
     let button = rust_i18n::t!(btn.label());
+    let entry_open = view.read(cx).shortcut_entry_open();
+
+    if entry_open {
+        return shortcut_entry_card(
+            pal,
+            &view,
+            Rc::new({
+                let view = view.clone();
+                let popover = cx.entity().downgrade();
+                move |action: Action, window: &mut Window, cx: &mut App| {
+                    cx.update_global::<AppState, _>(|state, _| state.commit_binding(btn, action));
+                    view.update(cx, |v, vcx| {
+                        v.close_shortcut_entry();
+                        vcx.notify();
+                    });
+                    if let Some(p) = popover.upgrade() {
+                        p.update(cx, |s, cx| s.dismiss(window, cx));
+                    }
+                }
+            }),
+            cx,
+        );
+    }
+
+    let mut rows = action_rows("action-item", current.as_ref(), &on_pick, pal);
+    rows.push(custom_shortcut_row(&view, pal));
+
     menu_card(pal)
         .min_w(px(POPOVER_W))
         .child(title(tr!("Bind %{name}", name => button), pal))
         .child(divider(pal))
-        .child(scroll_list(
-            "picker-scroll",
-            action_rows("action-item", current.as_ref(), &on_pick, pal),
-        ))
+        .child(scroll_list("picker-scroll", rows))
         .into_any_element()
 }
 
@@ -256,17 +288,271 @@ fn flyout_card(
             state.commit_gesture_binding(button, dir, action);
         });
         // Stay open; re-render so the level-1 cell + checkmark update.
-        view_pick.update(cx, |_, vcx| vcx.notify());
+        view_pick.update(cx, |v, vcx| {
+            v.close_shortcut_entry();
+            vcx.notify();
+        });
     });
+
+    if view.read(cx).shortcut_entry_open() {
+        return shortcut_entry_card(
+            pal,
+            view,
+            Rc::new({
+                let view = view.clone();
+                move |action: Action, _window: &mut Window, cx: &mut App| {
+                    cx.update_global::<AppState, _>(|state, _| {
+                        state.commit_gesture_binding(button, dir, action);
+                    });
+                    view.update(cx, |v, vcx| {
+                        v.close_shortcut_entry();
+                        vcx.notify();
+                    });
+                }
+            }),
+            cx,
+        );
+    }
+
+    let mut rows = action_rows("gesture-action", Some(&current), &on_pick, pal);
+    rows.push(custom_shortcut_row(view, pal));
 
     menu_card(pal)
         .min_w(px(POPOVER_W))
         .child(title(format!("{}  {}", dir.glyph(), tr!(dir.label())), pal))
         .child(divider(pal))
-        .child(scroll_list(
-            "gesture-dir-scroll",
-            action_rows("gesture-action", Some(&current), &on_pick, pal),
-        ))
+        .child(scroll_list("gesture-dir-scroll", rows))
+        .into_any_element()
+}
+
+/// Trailing "Custom shortcut…" row that opens the type-in panel.
+fn custom_shortcut_row(view: &Entity<MouseModelView>, pal: Palette) -> AnyElement {
+    let view = view.clone();
+    menu_row("custom-shortcut-row", pal, false)
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    svg()
+                        .path("action-icons/keyboard.svg")
+                        .size_4()
+                        .flex_none()
+                        .text_color(pal.text_muted),
+                )
+                .child(div().child(tr!("Custom shortcut…"))),
+        )
+        .on_click(move |_event, _window, cx| {
+            view.update(cx, |v, vcx| {
+                v.open_shortcut_entry();
+                vcx.notify();
+            });
+        })
+        .into_any_element()
+}
+
+/// Type-in panel: user types a chord like `Alt+Tab` and confirms.
+fn shortcut_entry_card(
+    pal: Palette,
+    view: &Entity<MouseModelView>,
+    on_commit: PickFn,
+    cx: &mut Context<PopoverState>,
+) -> AnyElement {
+    let draft = view.read(cx).shortcut_draft().to_string();
+    let error = view.read(cx).shortcut_error().map(str::to_string);
+    let display = if draft.is_empty() {
+        "Alt+Tab".to_string()
+    } else {
+        draft.clone()
+    };
+    let placeholder = draft.is_empty();
+
+    let focus = cx.focus_handle();
+    let view_keys = view.clone();
+    let view_back = view.clone();
+    let view_ok = view.clone();
+    let on_ok_keys = on_commit.clone();
+    let on_ok_btn = on_commit;
+
+    menu_card(pal)
+        .min_w(px(240.))
+        .child(title(tr!("Custom shortcut"), pal))
+        .child(divider(pal))
+        .child(
+            div()
+                .px_2()
+                .pb_1()
+                .text_xs()
+                .text_color(pal.text_muted)
+                .child(tr!("Type a chord, e.g. Alt+Tab or Ctrl+Shift+C")),
+        )
+        .child(
+            div()
+                .id("shortcut-entry-field")
+                .mx_2()
+                .mb_1()
+                .px_2()
+                .py_1p5()
+                .rounded_md()
+                .border_1()
+                .border_color(pal.border)
+                .bg(pal.surface_hover)
+                .text_sm()
+                .text_color(if placeholder {
+                    pal.text_muted
+                } else {
+                    pal.text_primary
+                })
+                .child(display)
+                .track_focus(&focus)
+                .on_key_down(move |event, window, cx| {
+                    let key = event.keystroke.key.as_str();
+                    match key {
+                        "backspace" => {
+                            view_keys.update(cx, |v, vcx| {
+                                v.pop_shortcut_char();
+                                vcx.notify();
+                            });
+                        }
+                        "enter" => {
+                            let text = view_keys.read(cx).shortcut_draft().to_string();
+                            match KeyCombo::parse_typed(&text) {
+                                Ok(combo) => {
+                                    (on_ok_keys)(Action::CustomShortcut(combo), window, cx);
+                                }
+                                Err(err) => {
+                                    view_keys.update(cx, |v, vcx| {
+                                        v.set_shortcut_error(err);
+                                        vcx.notify();
+                                    });
+                                }
+                            }
+                        }
+                        "escape" => {
+                            view_keys.update(cx, |v, vcx| {
+                                v.close_shortcut_entry();
+                                vcx.notify();
+                            });
+                        }
+                        // Single printable character keys (letters, digits, +).
+                        k if k.len() == 1 => {
+                            let ch = k.chars().next().unwrap();
+                            if ch.is_ascii_graphic() || ch == ' ' {
+                                view_keys.update(cx, |v, vcx| {
+                                    // Letters typed as key names are lowercase in gpui.
+                                    let out = if ch.is_ascii_alphabetic() {
+                                        ch.to_ascii_uppercase()
+                                    } else {
+                                        ch
+                                    };
+                                    v.push_shortcut_char(out);
+                                    vcx.notify();
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }),
+        )
+        .when_some(error, |col, err| {
+            col.child(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .text_xs()
+                    .text_color(rgb(0xdc_26_26))
+                    .child(err),
+            )
+        })
+        // Quick-insert chips so users don't have to hunt for keys.
+        .child(
+            h_flex()
+                .w_full()
+                .px_2()
+                .pb_1()
+                .gap_1()
+                .children(
+                    ["Ctrl+", "Alt+", "Shift+", "Win+", "Tab"]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, label)| {
+                            let view = view.clone();
+                            let insert = label.to_string();
+                            div()
+                                .id(("shortcut-chip", i))
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(pal.text_muted)
+                                .bg(pal.surface_hover)
+                                .hover(|s| s.text_color(pal.text_primary))
+                                .cursor_pointer()
+                                .child(label)
+                                .on_click(move |_e, _w, cx| {
+                                    view.update(cx, |v, vcx| {
+                                        for c in insert.chars() {
+                                            v.push_shortcut_char(c);
+                                        }
+                                        vcx.notify();
+                                    });
+                                })
+                        }),
+                ),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .px_2()
+                .pb_2()
+                .gap_2()
+                .justify_end()
+                .child(
+                    div()
+                        .id("shortcut-cancel")
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .text_sm()
+                        .text_color(pal.text_muted)
+                        .hover(|s| s.bg(pal.surface_hover))
+                        .cursor_pointer()
+                        .child(tr!("Back"))
+                        .on_click(move |_e, _w, cx| {
+                            view_back.update(cx, |v, vcx| {
+                                v.close_shortcut_entry();
+                                vcx.notify();
+                            });
+                        }),
+                )
+                .child(
+                    div()
+                        .id("shortcut-apply")
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .text_sm()
+                        .text_color(rgb(0xff_ff_ff))
+                        .bg(rgb(ACCENT_BLUE))
+                        .hover(|s| s.opacity(0.9))
+                        .cursor_pointer()
+                        .child(tr!("Apply"))
+                        .on_click(move |_e, window, cx| {
+                            let text = view_ok.read(cx).shortcut_draft().to_string();
+                            match KeyCombo::parse_typed(&text) {
+                                Ok(combo) => {
+                                    (on_ok_btn)(Action::CustomShortcut(combo), window, cx);
+                                }
+                                Err(err) => {
+                                    view_ok.update(cx, |v, vcx| {
+                                        v.set_shortcut_error(err);
+                                        vcx.notify();
+                                    });
+                                }
+                            }
+                        }),
+                ),
+        )
         .into_any_element()
 }
 

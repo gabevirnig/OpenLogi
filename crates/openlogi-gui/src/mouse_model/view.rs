@@ -62,6 +62,11 @@ pub struct MouseModelView {
     /// state, so the popover's `on_open_change` — which runs outside paint — can
     /// reset it without tripping gpui's render-only guard.
     gesture_active_dir: Option<GestureDirection>,
+    /// Typed custom-shortcut draft shown when the user picks "Custom shortcut…"
+    /// in an action picker. `None` = normal catalog list.
+    shortcut_draft: Option<String>,
+    /// Parse error for the typed shortcut draft, if any.
+    shortcut_error: Option<String>,
     _state_obs: Subscription,
 }
 
@@ -72,6 +77,8 @@ impl MouseModelView {
         Self {
             hovered: None,
             gesture_active_dir: None,
+            shortcut_draft: None,
+            shortcut_error: None,
             _state_obs: state_obs,
         }
     }
@@ -85,6 +92,60 @@ impl MouseModelView {
     /// `cx.notify()` to re-render.
     pub(crate) fn set_gesture_selected_dir(&mut self, dir: Option<GestureDirection>) {
         self.gesture_active_dir = dir;
+    }
+
+    /// Whether the custom-shortcut type-in panel is open.
+    pub(crate) fn shortcut_entry_open(&self) -> bool {
+        self.shortcut_draft.is_some()
+    }
+
+    /// Current typed shortcut text (empty string when entry is open but blank).
+    pub(crate) fn shortcut_draft(&self) -> &str {
+        self.shortcut_draft.as_deref().unwrap_or("")
+    }
+
+    /// Current parse error for the typed shortcut, if any.
+    pub(crate) fn shortcut_error(&self) -> Option<&str> {
+        self.shortcut_error.as_deref()
+    }
+
+    /// Open the type-in custom-shortcut panel (starts with an empty draft).
+    pub(crate) fn open_shortcut_entry(&mut self) {
+        self.shortcut_draft = Some(String::new());
+        self.shortcut_error = None;
+    }
+
+    /// Close the type-in panel and clear any error.
+    pub(crate) fn close_shortcut_entry(&mut self) {
+        self.shortcut_draft = None;
+        self.shortcut_error = None;
+    }
+
+    /// Replace the typed draft (caller re-renders).
+    pub(crate) fn set_shortcut_draft(&mut self, text: String) {
+        self.shortcut_draft = Some(text);
+        self.shortcut_error = None;
+    }
+
+    /// Append a character to the typed draft.
+    pub(crate) fn push_shortcut_char(&mut self, c: char) {
+        if let Some(draft) = self.shortcut_draft.as_mut() {
+            draft.push(c);
+            self.shortcut_error = None;
+        }
+    }
+
+    /// Delete the last character of the typed draft.
+    pub(crate) fn pop_shortcut_char(&mut self) {
+        if let Some(draft) = self.shortcut_draft.as_mut() {
+            draft.pop();
+            self.shortcut_error = None;
+        }
+    }
+
+    /// Record a parse error for the typed draft.
+    pub(crate) fn set_shortcut_error(&mut self, err: String) {
+        self.shortcut_error = Some(err);
     }
 }
 
@@ -462,6 +523,7 @@ where
             if !*open {
                 view_reset.update(cx, |v, vcx| {
                     v.set_gesture_selected_dir(None);
+                    v.close_shortcut_entry();
                     vcx.notify();
                 });
             }
@@ -520,6 +582,17 @@ fn label_popover(
             .anchor(Anchor::TopLeft)
             .mouse_button(MouseButton::Left)
             .trigger(trigger)
+            .on_open_change({
+                let view = view.clone();
+                move |open, _window, cx| {
+                    if !*open {
+                        view.update(cx, |v, vcx| {
+                            v.close_shortcut_entry();
+                            vcx.notify();
+                        });
+                    }
+                }
+            })
             .content(move |_state, _window, cx| action_picker(label.id, &view, cx))
             .into_any_element()
     };
@@ -750,6 +823,17 @@ fn hotspot_popover(
             .anchor(Anchor::TopRight)
             .mouse_button(MouseButton::Left)
             .trigger(trigger)
+            .on_open_change({
+                let view = view.clone();
+                move |open, _window, cx| {
+                    if !*open {
+                        view.update(cx, |v, vcx| {
+                            v.close_shortcut_entry();
+                            vcx.notify();
+                        });
+                    }
+                }
+            })
             .content(move |_state, _window, cx| action_picker(hotspot.id, &view, cx))
             .into_any_element()
     };

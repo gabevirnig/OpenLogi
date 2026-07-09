@@ -514,6 +514,72 @@ impl KeyCombo {
     pub const MOD_CTRL: u8 = 1 << 2;
     pub const MOD_OPTION: u8 = 1 << 3;
 
+    /// Parse a typed chord like `"Alt+Tab"`, `"Ctrl+Shift+C"`, or `"Win+D"`.
+    ///
+    /// Tokens are split on `+` (and optional spaces). Modifier names are
+    /// case-insensitive (`ctrl`/`control`, `alt`/`option`, `shift`,
+    /// `cmd`/`command`/`win`/`super`/`meta`). The final non-modifier token is
+    /// the key (`A`–`Z`, `0`–`9`, `Tab`, `Space`, `Enter`, `Esc`, arrows, `F1`–
+    /// `F12`, and common punctuation).
+    ///
+    /// On success, [`Self::display`] is set to a cleaned `Mod+Key` label.
+    pub fn parse_typed(input: &str) -> Result<Self, String> {
+        let raw = input.trim();
+        if raw.is_empty() {
+            return Err("Type a shortcut, e.g. Alt+Tab".into());
+        }
+        let parts: Vec<&str> = raw
+            .split('+')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        if parts.is_empty() {
+            return Err("Type a shortcut, e.g. Alt+Tab".into());
+        }
+        let mut modifiers = 0u8;
+        let mut key_token: Option<&str> = None;
+        for (i, part) in parts.iter().enumerate() {
+            let lower = part.to_ascii_lowercase();
+            let is_mod = match lower.as_str() {
+                "ctrl" | "control" | "ctl" => {
+                    modifiers |= Self::MOD_CTRL;
+                    true
+                }
+                "alt" | "option" | "opt" => {
+                    modifiers |= Self::MOD_OPTION;
+                    true
+                }
+                "shift" | "shft" => {
+                    modifiers |= Self::MOD_SHIFT;
+                    true
+                }
+                "cmd" | "command" | "win" | "windows" | "super" | "meta" | "gui" => {
+                    modifiers |= Self::MOD_CMD;
+                    true
+                }
+                _ => false,
+            };
+            if is_mod {
+                continue;
+            }
+            if i != parts.len() - 1 {
+                return Err(format!("Unknown modifier '{part}'"));
+            }
+            key_token = Some(part);
+        }
+        let Some(key_token) = key_token else {
+            return Err("Add a key after the modifiers, e.g. Alt+Tab".into());
+        };
+        let key_code = parse_key_token(key_token)
+            .ok_or_else(|| format!("Unknown key '{key_token}'"))?;
+        let display = format_typed_display(modifiers, key_token);
+        Ok(Self {
+            modifiers,
+            key_code,
+            display,
+        })
+    }
+
     /// Build the human-readable label from the modifier bitmask + key code.
     /// Falls back to `"⌘key 0xNN"` when the key code isn't one of the
     /// commonly-recognised letters; the recorder UI usually overrides this
@@ -556,6 +622,10 @@ impl KeyCombo {
             0x22 => out.push('I'),
             0x1F => out.push('O'),
             0x23 => out.push('P'),
+            0x30 => out.push_str("Tab"),
+            0x31 => out.push_str("Space"),
+            0x24 => out.push_str("Enter"),
+            0x35 => out.push_str("Esc"),
             _ => {
                 use std::fmt::Write as _;
                 let _ = write!(out, "key 0x{:02X}", self.key_code);
@@ -563,6 +633,125 @@ impl KeyCombo {
         }
         out
     }
+}
+
+/// Map a typed key name to a macOS `kVK_*` code (the wire format for
+/// [`KeyCombo::key_code`]).
+fn parse_key_token(token: &str) -> Option<u16> {
+    let lower = token.to_ascii_lowercase();
+    match lower.as_str() {
+        "tab" => Some(0x30),
+        "space" | "spc" => Some(0x31),
+        "enter" | "return" | "ret" => Some(0x24),
+        "esc" | "escape" => Some(0x35),
+        "backspace" | "bksp" => Some(0x33),
+        "delete" | "del" => Some(0x75),
+        "left" | "leftarrow" => Some(0x7B),
+        "right" | "rightarrow" => Some(0x7C),
+        "down" | "downarrow" => Some(0x7D),
+        "up" | "uparrow" => Some(0x7E),
+        "home" => Some(0x73),
+        "end" => Some(0x77),
+        "pageup" | "pgup" => Some(0x74),
+        "pagedown" | "pgdn" | "pgdown" => Some(0x79),
+        "f1" => Some(0x7A),
+        "f2" => Some(0x78),
+        "f3" => Some(0x63),
+        "f4" => Some(0x76),
+        "f5" => Some(0x60),
+        "f6" => Some(0x61),
+        "f7" => Some(0x62),
+        "f8" => Some(0x64),
+        "f9" => Some(0x65),
+        "f10" => Some(0x6D),
+        "f11" => Some(0x67),
+        "f12" => Some(0x6F),
+        "-" | "minus" | "hyphen" => Some(0x1B),
+        "=" | "equals" | "equal" | "plus" => Some(0x18),
+        "[" => Some(0x21),
+        "]" => Some(0x1E),
+        "\\" | "backslash" => Some(0x2A),
+        ";" | "semicolon" => Some(0x29),
+        "'" | "quote" | "apostrophe" => Some(0x27),
+        "," | "comma" => Some(0x2B),
+        "." | "period" | "dot" => Some(0x2F),
+        "/" | "slash" => Some(0x2C),
+        "`" | "grave" | "backtick" => Some(0x32),
+        _ => {
+            let chars: Vec<char> = token.chars().collect();
+            if chars.len() == 1 {
+                let c = chars[0].to_ascii_uppercase();
+                return match c {
+                    'A' => Some(0x00),
+                    'S' => Some(0x01),
+                    'D' => Some(0x02),
+                    'F' => Some(0x03),
+                    'H' => Some(0x04),
+                    'G' => Some(0x05),
+                    'Z' => Some(0x06),
+                    'X' => Some(0x07),
+                    'C' => Some(0x08),
+                    'V' => Some(0x09),
+                    'B' => Some(0x0B),
+                    'Q' => Some(0x0C),
+                    'W' => Some(0x0D),
+                    'E' => Some(0x0E),
+                    'R' => Some(0x0F),
+                    'Y' => Some(0x10),
+                    'T' => Some(0x11),
+                    '1' => Some(0x12),
+                    '2' => Some(0x13),
+                    '3' => Some(0x14),
+                    '4' => Some(0x15),
+                    '6' => Some(0x16),
+                    '5' => Some(0x17),
+                    '9' => Some(0x19),
+                    '7' => Some(0x1A),
+                    '8' => Some(0x1C),
+                    '0' => Some(0x1D),
+                    'O' => Some(0x1F),
+                    'U' => Some(0x20),
+                    'I' => Some(0x22),
+                    'P' => Some(0x23),
+                    'L' => Some(0x25),
+                    'J' => Some(0x26),
+                    'K' => Some(0x28),
+                    'N' => Some(0x2D),
+                    'M' => Some(0x2E),
+                    _ => None,
+                };
+            }
+            None
+        }
+    }
+}
+
+fn format_typed_display(modifiers: u8, key_token: &str) -> String {
+    let mut parts = Vec::new();
+    if modifiers & KeyCombo::MOD_CTRL != 0 {
+        parts.push("Ctrl".to_string());
+    }
+    if modifiers & KeyCombo::MOD_OPTION != 0 {
+        parts.push("Alt".to_string());
+    }
+    if modifiers & KeyCombo::MOD_SHIFT != 0 {
+        parts.push("Shift".to_string());
+    }
+    if modifiers & KeyCombo::MOD_CMD != 0 {
+        parts.push("Win".to_string());
+    }
+    let key = if key_token.chars().count() == 1 {
+        key_token.to_ascii_uppercase()
+    } else {
+        // Title-case common names.
+        let mut c = key_token.chars();
+        match c.next() {
+            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            None => key_token.to_string(),
+        }
+    };
+    parts.push(key);
+    parts.join("+")
 }
 
 /// What a single rebindable [`ButtonId`] does: either one [`Action`], or — for a
@@ -1284,6 +1473,31 @@ mod tests {
             display: "⌘⇧P".into(),
         });
         assert_eq!(roundtrip(&action), action);
+    }
+
+    #[test]
+    fn parse_typed_alt_tab() {
+        let combo = KeyCombo::parse_typed("Alt+Tab").expect("parse");
+        assert_eq!(combo.modifiers, KeyCombo::MOD_OPTION);
+        assert_eq!(combo.key_code, 0x30);
+        assert_eq!(combo.display, "Alt+Tab");
+    }
+
+    #[test]
+    fn parse_typed_ctrl_shift_c() {
+        let combo = KeyCombo::parse_typed("ctrl+shift+c").expect("parse");
+        assert_eq!(
+            combo.modifiers,
+            KeyCombo::MOD_CTRL | KeyCombo::MOD_SHIFT
+        );
+        assert_eq!(combo.key_code, 0x08); // C
+        assert_eq!(combo.display, "Ctrl+Shift+C");
+    }
+
+    #[test]
+    fn parse_typed_rejects_modifier_only() {
+        assert!(KeyCombo::parse_typed("Alt+").is_err());
+        assert!(KeyCombo::parse_typed("Ctrl").is_err());
     }
 
     #[test]
