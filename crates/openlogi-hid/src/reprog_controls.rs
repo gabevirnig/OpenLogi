@@ -54,17 +54,21 @@ pub const DPI_MODE_SHIFT_CIDS: [u16; 3] = [0x00c4, 0x00ed, 0x00fd];
 /// Known Back-family control IDs (Solaar `special_keys.py` + `0x1b04` list).
 /// Used as a fallback when task-id discovery finds nothing; primary matching
 /// is by [`is_back_task`] / [`is_forward_task`] so unknown CIDs still work.
-pub const BACK_CIDS: [u16; 7] = [
+///
+/// Intentionally excludes horizontal-scroll CIDs (`0x00AC` Back_Hscroll,
+/// tilt/scroll-left buttons, etc.) — diverting those breaks the thumb wheel
+/// and can false-fire side-button gesture actions (e.g. Mission Control).
+pub const BACK_CIDS: [u16; 6] = [
     0x0053, // Back_Button (MX Vertical / classic)
     0x0054, // Back (HID)
     0x0055, // Back_As_Alt_Win_Arrow
     0x00bd, // MultiPlatform Back
     0x00ce, // MultiPlatform Back (alt)
     0x00db, // Back_Button_Short_Press
-    0x00ac, // Back_Hscroll (some MX models)
 ];
 
 /// Known Forward-family control IDs.
+/// Excludes scroll-tilt CIDs (`0x005A`/`0x005C` left/right scroll-as-button).
 pub const FORWARD_CIDS: [u16; 5] = [
     0x0056, // Forward_Button (MX Vertical / classic)
     0x0057, // Forward_As_HID
@@ -73,23 +77,25 @@ pub const FORWARD_CIDS: [u16; 5] = [
     0x00d9, // Next_Button_Shortpress (forward rocker on some MX)
 ];
 
-/// Solaar / Logitech task IDs that mean "Back" on a mouse control.
+/// Solaar / Logitech task IDs that mean "Back" on a **clickable mouse button**.
 /// Task IDs are more stable across MX Master firmware than raw CIDs.
-pub const BACK_TASK_IDS: [u16; 6] = [
+///
+/// Excludes horizontal-scroll tasks (`0x008B` WIN8_BACK_HORZ_LEFT, etc.) so the
+/// thumb wheel is never diverted as a Back button.
+pub const BACK_TASK_IDS: [u16; 5] = [
     0x003b, // BACK
     0x003c, // MOUSE_BACK_BUTTON
     0x0084, // WIN8_BACK
-    0x008b, // WIN8_BACK_HORZ_LEFT
     0x0099, // MULTI_PLATFORM_BACK
     0x00ab, // MULTI_PLATFORM_BACK_2
 ];
 
-/// Task IDs that mean "Forward" on a mouse control.
-pub const FORWARD_TASK_IDS: [u16; 5] = [
+/// Task IDs that mean "Forward" on a clickable mouse button.
+/// Excludes horizontal-scroll tasks (`0x008C` WIN8_FORWARD_HORZ_RIGHT).
+pub const FORWARD_TASK_IDS: [u16; 4] = [
     0x003d, // BROWSER_FORWARD
     0x003e, // MOUSE_FORWARD_BUTTON
     0x0085, // WIN8_FORWARD
-    0x008c, // WIN8_FORWARD_HORZ_RIGHT
     0x00ac, // MULTI_PLATFORM_FORWARD
 ];
 
