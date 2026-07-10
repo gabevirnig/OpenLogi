@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    Anchor, AnyElement, App, BorrowAppContext as _, Context, ElementId, Entity, Hsla,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, RenderOnce,
+    Anchor, AnyElement, App, AppContext as _, BorrowAppContext as _, Context, ElementId, Entity,
+    Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, RenderOnce,
     StatefulInteractiveElement as _, Styled, Subscription, Window, canvas, div, hsla, img,
     prelude::FluentBuilder as _, px, rgb, svg,
 };

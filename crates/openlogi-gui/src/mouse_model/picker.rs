@@ -27,7 +27,7 @@ use gpui::{
     prelude::FluentBuilder as _, px, rgb, svg,
 };
 use gpui_component::{
-    Icon, IconName, h_flex,
+    Icon, IconName, Sizable, h_flex,
     input::Input,
     popover::PopoverState, v_flex,
 };
