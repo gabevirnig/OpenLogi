@@ -26,7 +26,11 @@ use gpui::{
     IntoElement, ParentElement, StatefulInteractiveElement as _, Styled, Window, div,
     prelude::FluentBuilder as _, px, rgb, svg,
 };
-use gpui_component::{Icon, IconName, h_flex, popover::PopoverState, v_flex};
+use gpui_component::{
+    Icon, IconName, h_flex,
+    input::Input,
+    popover::PopoverState, v_flex,
+};
 
 use openlogi_core::binding::KeyCombo;
 
@@ -342,9 +346,9 @@ fn custom_shortcut_row(view: &Entity<MouseModelView>, pal: Palette) -> AnyElemen
                 )
                 .child(div().child(tr!("Custom shortcut…"))),
         )
-        .on_click(move |_event, _window, cx| {
+        .on_click(move |_event, window, cx| {
             view.update(cx, |v, vcx| {
-                v.open_shortcut_entry();
+                v.open_shortcut_entry(window, vcx);
                 vcx.notify();
             });
         })
@@ -358,24 +362,22 @@ fn shortcut_entry_card(
     on_commit: PickFn,
     cx: &mut Context<PopoverState>,
 ) -> AnyElement {
-    let draft = view.read(cx).shortcut_draft().to_string();
     let error = view.read(cx).shortcut_error().map(str::to_string);
-    let display = if draft.is_empty() {
-        "Alt+Tab".to_string()
-    } else {
-        draft.clone()
+    let Some(input) = view.read(cx).shortcut_input().cloned() else {
+        // Panel claimed open but input missing — fall back to empty card.
+        return menu_card(pal)
+            .min_w(px(240.))
+            .child(title(tr!("Custom shortcut"), pal))
+            .into_any_element();
     };
-    let placeholder = draft.is_empty();
 
-    let focus = cx.focus_handle();
-    let view_keys = view.clone();
     let view_back = view.clone();
     let view_ok = view.clone();
-    let on_ok_keys = on_commit.clone();
+    let view_clear = view.clone();
     let on_ok_btn = on_commit;
 
     menu_card(pal)
-        .min_w(px(240.))
+        .min_w(px(260.))
         .child(title(tr!("Custom shortcut"), pal))
         .child(divider(pal))
         .child(
@@ -387,72 +389,36 @@ fn shortcut_entry_card(
                 .child(tr!("Type a chord, e.g. Alt+Tab or Ctrl+Shift+C")),
         )
         .child(
-            div()
-                .id("shortcut-entry-field")
-                .mx_2()
-                .mb_1()
+            h_flex()
+                .w_full()
                 .px_2()
-                .py_1p5()
-                .rounded_md()
-                .border_1()
-                .border_color(pal.border)
-                .bg(pal.surface_hover)
-                .text_sm()
-                .text_color(if placeholder {
-                    pal.text_muted
-                } else {
-                    pal.text_primary
-                })
-                .child(display)
-                .track_focus(&focus)
-                .on_key_down(move |event, window, cx| {
-                    let key = event.keystroke.key.as_str();
-                    match key {
-                        "backspace" => {
-                            view_keys.update(cx, |v, vcx| {
-                                v.pop_shortcut_char();
+                .pb_1()
+                .gap_1()
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(Input::new(&input).small().cleanable(true)),
+                )
+                .child(
+                    div()
+                        .id("shortcut-clear-x")
+                        .px_1p5()
+                        .py_1()
+                        .rounded_md()
+                        .text_sm()
+                        .text_color(pal.text_muted)
+                        .hover(|s| s.bg(pal.surface_hover).text_color(pal.text_primary))
+                        .cursor_pointer()
+                        .child("×")
+                        .on_click(move |_e, window, cx| {
+                            view_clear.update(cx, |v, vcx| {
+                                v.clear_shortcut_text(window, vcx);
                                 vcx.notify();
                             });
-                        }
-                        "enter" => {
-                            let text = view_keys.read(cx).shortcut_draft().to_string();
-                            match KeyCombo::parse_typed(&text) {
-                                Ok(combo) => {
-                                    (on_ok_keys)(Action::CustomShortcut(combo), window, cx);
-                                }
-                                Err(err) => {
-                                    view_keys.update(cx, |v, vcx| {
-                                        v.set_shortcut_error(err);
-                                        vcx.notify();
-                                    });
-                                }
-                            }
-                        }
-                        "escape" => {
-                            view_keys.update(cx, |v, vcx| {
-                                v.close_shortcut_entry();
-                                vcx.notify();
-                            });
-                        }
-                        // Single printable character keys (letters, digits, +).
-                        k if k.len() == 1 => {
-                            let ch = k.chars().next().unwrap();
-                            if ch.is_ascii_graphic() || ch == ' ' {
-                                view_keys.update(cx, |v, vcx| {
-                                    // Letters typed as key names are lowercase in gpui.
-                                    let out = if ch.is_ascii_alphabetic() {
-                                        ch.to_ascii_uppercase()
-                                    } else {
-                                        ch
-                                    };
-                                    v.push_shortcut_char(out);
-                                    vcx.notify();
-                                });
-                            }
-                        }
-                        _ => {}
-                    }
-                }),
+                        }),
+                ),
         )
         .when_some(error, |col, err| {
             col.child(
@@ -489,11 +455,9 @@ fn shortcut_entry_card(
                                 .hover(|s| s.text_color(pal.text_primary))
                                 .cursor_pointer()
                                 .child(label)
-                                .on_click(move |_e, _w, cx| {
+                                .on_click(move |_e, window, cx| {
                                     view.update(cx, |v, vcx| {
-                                        for c in insert.chars() {
-                                            v.push_shortcut_char(c);
-                                        }
+                                        v.append_shortcut_text(&insert, window, vcx);
                                         vcx.notify();
                                     });
                                 })
@@ -538,7 +502,7 @@ fn shortcut_entry_card(
                         .cursor_pointer()
                         .child(tr!("Apply"))
                         .on_click(move |_e, window, cx| {
-                            let text = view_ok.read(cx).shortcut_draft().to_string();
+                            let text = view_ok.read(cx).shortcut_draft(cx);
                             match KeyCombo::parse_typed(&text) {
                                 Ok(combo) => {
                                     (on_ok_btn)(Action::CustomShortcut(combo), window, cx);

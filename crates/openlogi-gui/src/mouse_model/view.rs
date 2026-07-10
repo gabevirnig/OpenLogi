@@ -6,7 +6,11 @@ use gpui::{
     StatefulInteractiveElement as _, Styled, Subscription, Window, canvas, div, hsla, img,
     prelude::FluentBuilder as _, px, rgb, svg,
 };
-use gpui_component::{Icon, IconName, Selectable, h_flex, popover::Popover, v_flex};
+use gpui_component::{
+    Icon, IconName, Selectable, h_flex,
+    input::{InputEvent, InputState},
+    popover::Popover, v_flex,
+};
 
 use crate::app::{glow_canvas, keyboard_glow};
 use crate::asset::{GlowGeometry, ResolvedAsset};
@@ -62,9 +66,12 @@ pub struct MouseModelView {
     /// state, so the popover's `on_open_change` — which runs outside paint — can
     /// reset it without tripping gpui's render-only guard.
     gesture_active_dir: Option<GestureDirection>,
-    /// Typed custom-shortcut draft shown when the user picks "Custom shortcut…"
-    /// in an action picker. `None` = normal catalog list.
-    shortcut_draft: Option<String>,
+    /// Text field for the custom-shortcut type-in panel. `Some` while the panel
+    /// is open; the real [`Input`] widget owns keyboard handling (so letters
+    /// type correctly on Windows).
+    shortcut_input: Option<Entity<InputState>>,
+    /// Keeps the input field live while the panel is open.
+    _shortcut_input_sub: Option<Subscription>,
     /// Parse error for the typed shortcut draft, if any.
     shortcut_error: Option<String>,
     _state_obs: Subscription,
@@ -77,7 +84,8 @@ impl MouseModelView {
         Self {
             hovered: None,
             gesture_active_dir: None,
-            shortcut_draft: None,
+            shortcut_input: None,
+            _shortcut_input_sub: None,
             shortcut_error: None,
             _state_obs: state_obs,
         }
@@ -96,12 +104,20 @@ impl MouseModelView {
 
     /// Whether the custom-shortcut type-in panel is open.
     pub(crate) fn shortcut_entry_open(&self) -> bool {
-        self.shortcut_draft.is_some()
+        self.shortcut_input.is_some()
     }
 
-    /// Current typed shortcut text (empty string when entry is open but blank).
-    pub(crate) fn shortcut_draft(&self) -> &str {
-        self.shortcut_draft.as_deref().unwrap_or("")
+    /// The text input for the open shortcut panel, if any.
+    pub(crate) fn shortcut_input(&self) -> Option<&Entity<InputState>> {
+        self.shortcut_input.as_ref()
+    }
+
+    /// Current typed shortcut text (empty when closed or blank).
+    pub(crate) fn shortcut_draft(&self, cx: &App) -> String {
+        self.shortcut_input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default()
     }
 
     /// Current parse error for the typed shortcut, if any.
@@ -109,38 +125,66 @@ impl MouseModelView {
         self.shortcut_error.as_deref()
     }
 
-    /// Open the type-in custom-shortcut panel (starts with an empty draft).
-    pub(crate) fn open_shortcut_entry(&mut self) {
-        self.shortcut_draft = Some(String::new());
+    /// Open the type-in custom-shortcut panel with a real text field.
+    pub(crate) fn open_shortcut_entry(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(tr!("Alt+Tab or Ctrl+Shift+C"))
+        });
+        self._shortcut_input_sub = Some(cx.subscribe(&input, |_view, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. }) {
+                cx.notify();
+            }
+        }));
+        // Focus so the user can type immediately.
+        input.update(cx, |state, cx| {
+            state.focus(window, cx);
+        });
+        self.shortcut_input = Some(input);
         self.shortcut_error = None;
     }
 
     /// Close the type-in panel and clear any error.
     pub(crate) fn close_shortcut_entry(&mut self) {
-        self.shortcut_draft = None;
+        self.shortcut_input = None;
+        self._shortcut_input_sub = None;
         self.shortcut_error = None;
     }
 
-    /// Replace the typed draft (caller re-renders).
-    pub(crate) fn set_shortcut_draft(&mut self, text: String) {
-        self.shortcut_draft = Some(text);
+    /// Append text to the open shortcut field (used by quick-insert chips).
+    pub(crate) fn append_shortcut_text(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.shortcut_input.clone() else {
+            return;
+        };
+        let mut next = input.read(cx).value().to_string();
+        next.push_str(text);
+        input.update(cx, |state, cx| {
+            state.set_value(next, window, cx);
+        });
         self.shortcut_error = None;
     }
 
-    /// Append a character to the typed draft.
-    pub(crate) fn push_shortcut_char(&mut self, c: char) {
-        if let Some(draft) = self.shortcut_draft.as_mut() {
-            draft.push(c);
-            self.shortcut_error = None;
-        }
-    }
-
-    /// Delete the last character of the typed draft.
-    pub(crate) fn pop_shortcut_char(&mut self) {
-        if let Some(draft) = self.shortcut_draft.as_mut() {
-            draft.pop();
-            self.shortcut_error = None;
-        }
+    /// Clear the open shortcut field (the field's own X also does this).
+    pub(crate) fn clear_shortcut_text(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self.shortcut_input.clone() else {
+            return;
+        };
+        input.update(cx, |state, cx| {
+            state.set_value(String::new(), window, cx);
+        });
+        self.shortcut_error = None;
     }
 
     /// Record a parse error for the typed draft.
