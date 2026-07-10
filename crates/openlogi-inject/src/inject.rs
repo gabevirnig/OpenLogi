@@ -1357,10 +1357,11 @@ mod windows {
     use std::mem::size_of;
 
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-        MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-        MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-        MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput,
+        INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC, MOUSEEVENTF_HWHEEL,
+        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+        MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput,
     };
 
     use openlogi_core::binding::{Action, KeyCombo};
@@ -1386,6 +1387,11 @@ mod windows {
     pub(super) const VK_SHIFT: u16 = 0x10;
     pub(super) const VK_CONTROL: u16 = 0x11;
     pub(super) const VK_MENU: u16 = 0x12;
+    /// Left-side variants — preferred for synthetic chords so global hotkey
+    /// engines see the same scancodes a physical left Ctrl/Alt/Shift produces.
+    const VK_LSHIFT: u16 = 0xA0;
+    const VK_LCONTROL: u16 = 0xA2;
+    const VK_LMENU: u16 = 0xA4;
     pub(super) const VK_LWIN: u16 = 0x5B;
     pub(super) const VK_BROWSER_BACK: u16 = 0xA6;
     pub(super) const VK_BROWSER_FORWARD: u16 = 0xA7;
@@ -1426,6 +1432,9 @@ mod windows {
     }
 
     pub(super) fn post_key(vk: u16, modifiers: &[u16]) {
+        // Prefer scancode injection: many global hotkey apps (Raycast, AutoHotkey
+        // with #UseHook, etc.) ignore pure VK SendInput events, while keyboard
+        // hardware works. Fall back to VK-only if MapVirtualKeyW has no mapping.
         let mut inputs = Vec::with_capacity(modifiers.len() * 2 + 2);
         for modifier in modifiers {
             inputs.push(key_input(*modifier, false));
@@ -1477,17 +1486,17 @@ mod windows {
         };
 
         let mut modifiers = Vec::new();
-        if combo.modifiers & KeyCombo::MOD_CMD != 0 {
-            modifiers.push(VK_CONTROL);
+        // MOD_CMD is Win on Windows for display, but CustomShortcut chords typed
+        // as Ctrl map through MOD_CTRL; both Cmd and Ctrl become left-Ctrl here
+        // so "Ctrl+Alt+Shift+G" matches Raycast-style bindings.
+        if combo.modifiers & (KeyCombo::MOD_CMD | KeyCombo::MOD_CTRL) != 0 {
+            modifiers.push(VK_LCONTROL);
         }
         if combo.modifiers & KeyCombo::MOD_SHIFT != 0 {
-            modifiers.push(VK_SHIFT);
-        }
-        if combo.modifiers & KeyCombo::MOD_CTRL != 0 && !modifiers.contains(&VK_CONTROL) {
-            modifiers.push(VK_CONTROL);
+            modifiers.push(VK_LSHIFT);
         }
         if combo.modifiers & KeyCombo::MOD_OPTION != 0 {
-            modifiers.push(VK_MENU);
+            modifiers.push(VK_LMENU);
         }
         post_key(vk, &modifiers);
     }
@@ -1516,7 +1525,27 @@ mod windows {
     }
 
     fn key_input(vk: u16, key_up: bool) -> INPUT {
-        let mut flags = 0;
+        // SAFETY: MapVirtualKeyW is a pure lookup; MAPVK_VK_TO_VSC returns 0 if
+        // the VK has no scancode (rare for the keys we inject).
+        let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) } as u16;
+        let mut flags = 0u32;
+        let (w_vk, w_scan) = if scan != 0 {
+            flags |= KEYEVENTF_SCANCODE;
+            // Navigation / right-side keys need the extended-key flag so hooks
+            // and hotkey engines see the same event a real keyboard produces.
+            if matches!(
+                vk,
+                0x21 | 0x22 | 0x23 | 0x24 | 0x25 | 0x26 | 0x27 | 0x28 // page/arrows/home/end
+                    | 0x2D | 0x2E // insert/delete
+                    | 0x5B | 0x5C // left/right Win
+                    | 0xA3 | 0xA5 // right Ctrl / right Alt
+            ) {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            (0u16, scan)
+        } else {
+            (vk, 0u16)
+        };
         if key_up {
             flags |= KEYEVENTF_KEYUP;
         }
@@ -1524,8 +1553,8 @@ mod windows {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
-                    wVk: vk,
-                    wScan: 0,
+                    wVk: w_vk,
+                    wScan: w_scan,
                     dwFlags: flags,
                     time: 0,
                     dwExtraInfo: 0,
